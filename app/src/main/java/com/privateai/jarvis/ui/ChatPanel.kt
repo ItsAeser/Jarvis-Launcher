@@ -1,7 +1,9 @@
 package com.privateai.jarvis.ui
 
 import android.Manifest
+import android.app.Activity
 import android.content.pm.PackageManager
+import android.speech.RecognizerIntent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -76,7 +78,6 @@ fun ChatPanel(
             scope.launch {
                 dao.insertChat(ChatMessageEntity(role = "user", text = prompt))
 
-                // Fast local rule: "open <app>" or "launch <app>" executes immediately
                 val localOpenMatch = Regex("^(?:open|launch|start)\\s+(.+)$", RegexOption.IGNORE_CASE)
                     .matchEntire(prompt)
                 if (localOpenMatch != null) {
@@ -112,7 +113,6 @@ fun ChatPanel(
                                 onNeedConfirm = { pendingConfirmation = it },
                                 onNeedPermission = { perms, req ->
                                     pendingPermissionTool = req
-                                    // Handled via permissionLauncher below
                                 }
                             )
                         } else {
@@ -129,6 +129,42 @@ fun ChatPanel(
                 isSending = false
             }
         }
+    }
+
+    // Fallback system speech dialog launcher (guaranteed crash-free on HyperOS 3 / Android 16)
+    val systemSpeechDialogLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val spoken = result.data
+                ?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+                ?.firstOrNull()
+                ?.trim()
+                .orEmpty()
+            if (spoken.isNotEmpty()) {
+                submitPrompt(spoken)
+            }
+        }
+    }
+
+    val beginVoiceCapture: () -> Unit = {
+        voiceManager.startListening(
+            onFinalResult = { spoken -> submitPrompt(spoken) },
+            onFallbackToSystemDialog = {
+                try {
+                    systemSpeechDialogLauncher.launch(voiceManager.buildRecognizerIntent())
+                } catch (_: Throwable) {
+                    scope.launch {
+                        dao.insertChat(
+                            ChatMessageEntity(
+                                role = "assistant",
+                                text = "⚠️ No speech recognition app found. Please install or enable 'Speech Recognition and Synthesis from Google' in Play Store."
+                            )
+                        )
+                    }
+                }
+            }
+        )
     }
 
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -160,7 +196,16 @@ fun ChatPanel(
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
         if (granted) {
-            voiceManager.startListening { spoken -> submitPrompt(spoken) }
+            beginVoiceCapture()
+        } else {
+            scope.launch {
+                dao.insertChat(
+                    ChatMessageEntity(
+                        role = "assistant",
+                        text = "⚠️ Microphone permission denied. Enable Microphone in App Info to use voice commands."
+                    )
+                )
+            }
         }
     }
 
@@ -296,7 +341,6 @@ fun ChatPanel(
             Spacer(modifier = Modifier.height(6.dp))
         }
 
-        // Prompt Input Bar + Voice Mic Button
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -332,7 +376,7 @@ fun ChatPanel(
                             Manifest.permission.RECORD_AUDIO
                         ) == PackageManager.PERMISSION_GRANTED
                         if (hasMic) {
-                            voiceManager.startListening { spoken -> submitPrompt(spoken) }
+                            beginVoiceCapture()
                         } else {
                             micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                         }

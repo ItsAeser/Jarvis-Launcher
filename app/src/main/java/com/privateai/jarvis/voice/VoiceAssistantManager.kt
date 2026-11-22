@@ -1,5 +1,6 @@
 package com.privateai.jarvis.voice
 
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
@@ -31,104 +32,156 @@ class VoiceAssistantManager(private val context: Context) {
     val voiceError: StateFlow<String?> = _voiceError.asStateFlow()
 
     init {
-        tts = TextToSpeech(context.applicationContext) { status ->
-            if (status == TextToSpeech.SUCCESS) {
-                val res = tts?.setLanguage(Locale.getDefault())
-                ttsReady = res != TextToSpeech.LANG_MISSING_DATA &&
-                    res != TextToSpeech.LANG_NOT_SUPPORTED
-                tts?.setSpeechRate(1.04f)
+        try {
+            tts = TextToSpeech(context.applicationContext) { status ->
+                if (status == TextToSpeech.SUCCESS) {
+                    val res = tts?.setLanguage(Locale.getDefault())
+                    ttsReady = res != TextToSpeech.LANG_MISSING_DATA &&
+                        res != TextToSpeech.LANG_NOT_SUPPORTED
+                    tts?.setSpeechRate(1.04f)
+                }
             }
+        } catch (_: Exception) {
+            ttsReady = false
         }
     }
 
-    fun startListening(onFinalResult: (String) -> Unit) {
+    /**
+     * Tries explicit Google Speech Services first (avoids HyperOS / Android System Intelligence
+     * binding crashes on Android 16), then falls back to default SpeechRecognizer, and finally
+     * signals false if inline recognition cannot bind so the UI can launch system voice dialog.
+     */
+    fun startListening(
+        onFinalResult: (String) -> Unit,
+        onFallbackToSystemDialog: () -> Unit
+    ) {
         _voiceError.value = null
-        if (!SpeechRecognizer.isRecognitionAvailable(context)) {
-            _voiceError.value = "Speech recognition service unavailable on this device."
-            return
-        }
-
         stopSpeaking()
         stopListening()
 
-        val recognizer = SpeechRecognizer.createSpeechRecognizer(context)
+        val recognizer = createSafeRecognizer()
+        if (recognizer == null) {
+            onFallbackToSystemDialog()
+            return
+        }
+
         speechRecognizer = recognizer
 
-        recognizer.setRecognitionListener(object : RecognitionListener {
-            override fun onReadyForSpeech(params: Bundle?) {
-                _isListening.value = true
-                _partialText.value = ""
-            }
-
-            override fun onBeginningOfSpeech() {}
-
-            override fun onRmsChanged(rmsdB: Float) {}
-
-            override fun onBufferReceived(buffer: ByteArray?) {}
-
-            override fun onEndOfSpeech() {
-                _isListening.value = false
-            }
-
-            override fun onError(error: Int) {
-                _isListening.value = false
-                _partialText.value = ""
-                if (error != SpeechRecognizer.ERROR_CLIENT &&
-                    error != SpeechRecognizer.ERROR_SPEECH_TIMEOUT
-                ) {
-                    _voiceError.value = "Mic error ($error). Tap mic to try again."
+        try {
+            recognizer.setRecognitionListener(object : RecognitionListener {
+                override fun onReadyForSpeech(params: Bundle?) {
+                    _isListening.value = true
+                    _partialText.value = ""
                 }
-            }
 
-            override fun onResults(results: Bundle?) {
-                _isListening.value = false
-                val text = results
-                    ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    ?.firstOrNull()
-                    ?.trim()
-                    .orEmpty()
-                _partialText.value = ""
-                if (text.isNotEmpty()) {
-                    onFinalResult(text)
+                override fun onBeginningOfSpeech() {}
+
+                override fun onRmsChanged(rmsdB: Float) {}
+
+                override fun onBufferReceived(buffer: ByteArray?) {}
+
+                override fun onEndOfSpeech() {
+                    _isListening.value = false
                 }
-            }
 
-            override fun onPartialResults(partialResults: Bundle?) {
-                val partial = partialResults
-                    ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    ?.firstOrNull()
-                    .orEmpty()
-                if (partial.isNotEmpty()) {
-                    _partialText.value = partial
+                override fun onError(error: Int) {
+                    _isListening.value = false
+                    _partialText.value = ""
+                    when (error) {
+                        SpeechRecognizer.ERROR_CLIENT,
+                        SpeechRecognizer.ERROR_SPEECH_TIMEOUT,
+                        SpeechRecognizer.ERROR_NO_MATCH -> {
+                            _voiceError.value = "Didn't catch that. Tap mic to try again."
+                        }
+                        else -> {
+                            // Service binding / HyperOS restriction error -> open standard voice dialog
+                            stopListening()
+                            onFallbackToSystemDialog()
+                        }
+                    }
                 }
-            }
 
-            override fun onEvent(eventType: Int, params: Bundle?) {}
-        })
+                override fun onResults(results: Bundle?) {
+                    _isListening.value = false
+                    val text = results
+                        ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        ?.firstOrNull()
+                        ?.trim()
+                        .orEmpty()
+                    _partialText.value = ""
+                    if (text.isNotEmpty()) {
+                        onFinalResult(text)
+                    }
+                }
 
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                override fun onPartialResults(partialResults: Bundle?) {
+                    val partial = partialResults
+                        ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        ?.firstOrNull()
+                        .orEmpty()
+                    if (partial.isNotEmpty()) {
+                        _partialText.value = partial
+                    }
+                }
+
+                override fun onEvent(eventType: Int, params: Bundle?) {}
+            })
+
+            val intent = buildRecognizerIntent()
+            recognizer.startListening(intent)
+        } catch (_: Throwable) {
+            stopListening()
+            onFallbackToSystemDialog()
+        }
+    }
+
+    fun buildRecognizerIntent(): Intent {
+        return Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(
                 RecognizerIntent.EXTRA_LANGUAGE_MODEL,
                 RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
             )
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-IN")
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak to J.A.R.V.I.S.")
+        }
+    }
+
+    private fun createSafeRecognizer(): SpeechRecognizer? {
+        // 1. Prefer Google Speech Services directly (prevents HyperOS / AiAiSpeechRecognition crash)
+        try {
+            val googleComponent = ComponentName(
+                "com.google.android.tts",
+                "com.google.android.apps.speech.tts.googletts.service.GoogleTTSRecognitionService"
+            )
+            val pm = context.packageManager
+            if (pm.getServiceInfo(googleComponent, 0) != null) {
+                return SpeechRecognizer.createSpeechRecognizer(context, googleComponent)
+            }
+        } catch (_: Throwable) {
         }
 
-        try {
-            recognizer.startListening(intent)
-        } catch (e: Exception) {
-            _isListening.value = false
-            _voiceError.value = "Could not start mic: ${e.message}"
+        // 2. Try standard system recognizer if available
+        return try {
+            if (SpeechRecognizer.isRecognitionAvailable(context)) {
+                SpeechRecognizer.createSpeechRecognizer(context)
+            } else {
+                null
+            }
+        } catch (_: Throwable) {
+            null
         }
     }
 
     fun stopListening() {
         try {
             speechRecognizer?.stopListening()
+        } catch (_: Throwable) {
+        }
+        try {
             speechRecognizer?.destroy()
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
         speechRecognizer = null
         _isListening.value = false
@@ -141,14 +194,18 @@ class VoiceAssistantManager(private val context: Context) {
             .trim()
         if (clean.isEmpty()) return
 
-        _isSpeaking.value = true
-        tts?.speak(clean, TextToSpeech.QUEUE_FLUSH, null, "jarvis_utterance")
+        try {
+            _isSpeaking.value = true
+            tts?.speak(clean, TextToSpeech.QUEUE_FLUSH, null, "jarvis_utterance")
+        } catch (_: Throwable) {
+            _isSpeaking.value = false
+        }
     }
 
     fun stopSpeaking() {
         try {
             tts?.stop()
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
         _isSpeaking.value = false
     }
@@ -158,7 +215,7 @@ class VoiceAssistantManager(private val context: Context) {
         stopSpeaking()
         try {
             tts?.shutdown()
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
         }
         tts = null
     }
