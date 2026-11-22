@@ -58,6 +58,7 @@ import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.FastForward
 import androidx.compose.material.icons.filled.Hearing
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MusicNote
@@ -255,9 +256,9 @@ fun LauncherScreen(
                             }
                         }
                         is RouteDecision.LocalFirst -> {
-                            val hybridRes = withTimeoutOrNull(35_000L) {
+                            val hybridRes = withTimeoutOrNull(45_000L) {
                                 hybridRouter.executeHybrid(prompt, messages, appLabels)
-                            } ?: Result.failure(IllegalStateException("Inference timed out after 35s. Check your local model or API settings."))
+                            } ?: Result.failure(IllegalStateException("Inference timed out after 45s. Check your local model or API settings."))
                             hybridRes.fold(
                                 onSuccess = { (turn, _) ->
                                     if (turn.toolRequest != null) {
@@ -472,7 +473,7 @@ fun LauncherScreen(
             }
 
             if (!isJarvisExpanded) {
-                Spacer(modifier = Modifier.height(4.dp))
+                Spacer(modifier = Modifier.height(2.dp))
                 Text(
                     text = currentTimeStr,
                     color = Color(0xFF7DD3FC),
@@ -486,56 +487,96 @@ fun LauncherScreen(
                     fontSize = 14.sp,
                     fontWeight = FontWeight.Medium
                 )
-                Spacer(modifier = Modifier.height(8.dp))
-                // Siri-style voice-reactive J.A.R.V.I.S. sphere
-                JarvisReactiveOrb(
-                    isListening = isListening,
-                    isSpeaking = isSpeaking,
-                    isProcessing = isSending,
-                    amplitude = voiceAmplitude,
-                    onClick = {
-                        if (isListening) {
-                            voiceManager.stopListening()
-                        } else {
-                            val hasMic = ContextCompat.checkSelfPermission(
-                                context,
-                                Manifest.permission.RECORD_AUDIO
-                            ) == PackageManager.PERMISSION_GRANTED
-                            if (hasMic) {
-                                beginVoiceCapture()
+                Spacer(modifier = Modifier.height(6.dp))
+
+                // Floating Siri-style voice-reactive ball + subtle keyboard toggle pill
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Spacer(modifier = Modifier.width(44.dp))
+                    JarvisReactiveOrb(
+                        isListening = isListening,
+                        isSpeaking = isSpeaking,
+                        isProcessing = isSending,
+                        amplitude = voiceAmplitude,
+                        sizeDp = 122f,
+                        onClick = {
+                            if (isListening) {
+                                voiceManager.stopListening()
                             } else {
-                                (context as? Activity)?.let { act ->
-                                    securityManager.suppressNextAutoLock()
-                                    ActivityCompat.requestPermissions(act, arrayOf(Manifest.permission.RECORD_AUDIO), 1001)
+                                val hasMic = ContextCompat.checkSelfPermission(
+                                    context,
+                                    Manifest.permission.RECORD_AUDIO
+                                ) == PackageManager.PERMISSION_GRANTED
+                                if (hasMic) {
+                                    beginVoiceCapture()
+                                } else {
+                                    (context as? Activity)?.let { act ->
+                                        securityManager.suppressNextAutoLock()
+                                        ActivityCompat.requestPermissions(act, arrayOf(Manifest.permission.RECORD_AUDIO), 1001)
+                                    }
                                 }
                             }
                         }
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Surface(
+                        onClick = { isJarvisExpanded = true },
+                        shape = CircleShape,
+                        color = Color(0x880F172A),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0x5538BDF8)),
+                        modifier = Modifier.size(36.dp)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                imageVector = Icons.Default.Keyboard,
+                                contentDescription = "Type to J.A.R.V.I.S.",
+                                tint = Color(0xFF7DD3FC),
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
                     }
-                )
-                Spacer(modifier = Modifier.height(8.dp))
+                }
+
+                val lastAssistant = messages.lastOrNull { it.role == "assistant" }?.text
+                if (isListening || !lastAssistant.isNullOrBlank()) {
+                    Text(
+                        text = if (isListening) (partialVoice.ifEmpty { "Listening..." }) else lastAssistant.orEmpty(),
+                        color = Color(0xFFE2E8F0),
+                        fontSize = 12.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier
+                            .fillMaxWidth(0.88f)
+                            .clickable { isJarvisExpanded = true }
+                            .padding(top = 2.dp)
+                    )
+                }
             } else {
                 JarvisReactiveOrb(
                     isListening = isListening,
                     isSpeaking = isSpeaking,
                     isProcessing = isSending,
                     amplitude = voiceAmplitude,
-                    sizeDp = 62f,
+                    sizeDp = 76f,
                     onClick = {
                         if (isListening) voiceManager.stopListening() else beginVoiceCapture()
                     }
                 )
                 Spacer(modifier = Modifier.height(6.dp))
-            }
 
-            // Glassmorphic J.A.R.V.I.S. Command & Chat Card
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .then(if (isJarvisExpanded) Modifier.weight(1f) else Modifier)
-                    .background(Color(0xCC0D1526), RoundedCornerShape(22.dp))
-                    .border(1.dp, Color(0x6638BDF8), RoundedCornerShape(22.dp))
-                    .padding(12.dp)
-            ) {
+                // Expanded Glassmorphic J.A.R.V.I.S. Chat Drawer
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
+                        .background(Color(0xD90D1526), RoundedCornerShape(22.dp))
+                        .border(1.dp, Color(0x6638BDF8), RoundedCornerShape(22.dp))
+                        .padding(12.dp)
+                ) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -572,7 +613,7 @@ fun LauncherScreen(
                             )
                         }
 
-                        if (messages.isNotEmpty()) {
+                        if (true) {
                             IconButton(
                                 onClick = { isJarvisExpanded = !isJarvisExpanded },
                                 modifier = Modifier.size(26.dp)
@@ -815,6 +856,7 @@ fun LauncherScreen(
                     ) {
                         Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "Send", modifier = Modifier.size(18.dp))
                     }
+                }
                 }
             }
         }

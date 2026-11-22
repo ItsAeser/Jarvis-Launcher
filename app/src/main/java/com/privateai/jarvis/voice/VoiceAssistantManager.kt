@@ -99,19 +99,40 @@ class VoiceAssistantManager(private val context: Context) {
      * Uses transient exclusive audio focus (never touches system ringer/notification volumes,
      * so HyperOS Silent Mode is never toggled).
      */
+    @Volatile
+    private var isMusicMutedForWake = false
+
+    /**
+     * Android 13-16 SpeechRecognizer plays its start/stop chime on STREAM_MUSIC.
+     * Muting STREAM_MUSIC briefly during silent wake-word starts blocks the ding
+     * without ever touching HyperOS Silent/Ringer/DND mode.
+     */
+    private fun muteWakeDingSafely() {
+        try {
+            if (!audioManager.isMusicActive && !isMusicMutedForWake) {
+                audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
+                isMusicMutedForWake = true
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun unmuteWakeDingSafely() {
+        try {
+            if (isMusicMutedForWake) {
+                audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
+                isMusicMutedForWake = false
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
     private fun acquireQuietFocus() {
         // No-op: HyperOS 3 triggers Silent/DND mode whenever AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE is requested.
     }
 
     private fun releaseQuietFocus() {
-        try {
-            focusRequest?.let { req ->
-                audioManager.abandonAudioFocusRequest(req)
-            }
-        } catch (_: Throwable) {
-        } finally {
-            focusRequest = null
-        }
+        unmuteWakeDingSafely()
     }
 
     fun playJarvisAckChime() {
@@ -201,9 +222,11 @@ class VoiceAssistantManager(private val context: Context) {
         wakeRecognizer = recognizer
 
         try {
-            acquireQuietFocus()
+            muteWakeDingSafely()
             recognizer.setRecognitionListener(object : RecognitionListener {
-                override fun onReadyForSpeech(params: Bundle?) {}
+                override fun onReadyForSpeech(params: Bundle?) {
+                    mainHandler.postDelayed({ unmuteWakeDingSafely() }, 120L)
+                }
                 override fun onBeginningOfSpeech() {}
                 override fun onRmsChanged(rmsdB: Float) {
                     // Map typical speech RMS (-2 dB to 10 dB) into 0f..1f for the reactive orb
@@ -211,7 +234,9 @@ class VoiceAssistantManager(private val context: Context) {
                     _voiceAmplitude.value = normalized
                 }
                 override fun onBufferReceived(buffer: ByteArray?) {}
-                override fun onEndOfSpeech() {}
+                override fun onEndOfSpeech() {
+                    muteWakeDingSafely()
+                }
 
                 override fun onError(error: Int) {
                     releaseQuietFocus()
@@ -261,6 +286,7 @@ class VoiceAssistantManager(private val context: Context) {
         val wakeRegex = Regex("^(?:hey\\s+|ok\\s+)?jarvis[,\\s]*(.*)$", RegexOption.IGNORE_CASE)
         val match = wakeRegex.matchEntire(lower)
         if (match != null) {
+            unmuteWakeDingSafely()
             playJarvisAckChime()
             val trailingCommand = transcript
                 .replace(Regex("^(?:hey\\s+|ok\\s+)?jarvis[,\\s]*", RegexOption.IGNORE_CASE), "")
