@@ -1,10 +1,17 @@
 package com.privateai.jarvis.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.widget.Toast
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Backspace
 import androidx.compose.material.icons.filled.Fingerprint
@@ -34,6 +41,7 @@ fun LockScreen(securityManager: SecurityManager) {
         )
     }
     var isError by remember { mutableStateOf(false) }
+    var crashTrace by remember { mutableStateOf(securityManager.getLastCrashTrace()) }
 
     val triggerBiometric = {
         val activity = context as? FragmentActivity
@@ -58,9 +66,44 @@ fun LockScreen(securityManager: SecurityManager) {
     }
 
     LaunchedEffect(Unit) {
-        if (!isSetupMode && securityManager.isBiometricEnabled()) {
+        if (!isSetupMode && securityManager.isBiometricEnabled() && crashTrace == null) {
             triggerBiometric()
         }
+    }
+
+    if (crashTrace != null) {
+        AlertDialog(
+            onDismissRequest = {
+                securityManager.clearLastCrashTrace()
+                crashTrace = null
+            },
+            title = { Text("Previous Crash Log Captured", color = Color(0xFFF87171)) },
+            text = {
+                Column(modifier = Modifier.heightIn(max = 280.dp).verticalScroll(rememberScrollState())) {
+                    Text(crashTrace!!, fontSize = 11.sp, color = Color.White)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    cm.setPrimaryClip(ClipData.newPlainText("JarvisCrash", crashTrace))
+                    Toast.makeText(context, "Crash log copied", Toast.LENGTH_SHORT).show()
+                    securityManager.clearLastCrashTrace()
+                    crashTrace = null
+                }) {
+                    Text("Copy & Dismiss")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    securityManager.clearLastCrashTrace()
+                    crashTrace = null
+                }) {
+                    Text("Dismiss")
+                }
+            },
+            containerColor = Color(0xFF111827)
+        )
     }
 
     Column(

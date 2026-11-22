@@ -33,6 +33,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.privateai.jarvis.ai.CloudChatClient
 import com.privateai.jarvis.ai.ToolRequest
@@ -131,7 +132,6 @@ fun ChatPanel(
         }
     }
 
-    // Fallback system speech dialog launcher (guaranteed crash-free on HyperOS 3 / Android 16)
     val systemSpeechDialogLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
     ) { result ->
@@ -148,23 +148,35 @@ fun ChatPanel(
     }
 
     val beginVoiceCapture: () -> Unit = {
-        voiceManager.startListening(
-            onFinalResult = { spoken -> submitPrompt(spoken) },
-            onFallbackToSystemDialog = {
-                try {
-                    systemSpeechDialogLauncher.launch(voiceManager.buildRecognizerIntent())
-                } catch (_: Throwable) {
-                    scope.launch {
-                        dao.insertChat(
-                            ChatMessageEntity(
-                                role = "assistant",
-                                text = "⚠️ No speech recognition app found. Please install or enable 'Speech Recognition and Synthesis from Google' in Play Store."
+        try {
+            voiceManager.startListening(
+                onFinalResult = { spoken -> submitPrompt(spoken) },
+                onFallbackToSystemDialog = {
+                    try {
+                        securityManager.suppressNextAutoLock()
+                        systemSpeechDialogLauncher.launch(voiceManager.buildRecognizerIntent())
+                    } catch (e: Throwable) {
+                        scope.launch {
+                            dao.insertChat(
+                                ChatMessageEntity(
+                                    role = "assistant",
+                                    text = "⚠️ Voice dialog unavailable (${e.javaClass.simpleName}): ${e.message}"
+                                )
                             )
-                        )
+                        }
                     }
                 }
+            )
+        } catch (e: Throwable) {
+            scope.launch {
+                dao.insertChat(
+                    ChatMessageEntity(
+                        role = "assistant",
+                        text = "⚠️ Voice error (${e.javaClass.simpleName}): ${e.message}"
+                    )
+                )
             }
-        )
+        }
     }
 
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -188,23 +200,6 @@ fun ChatPanel(
                     dao.insertChat(ChatMessageEntity(role = "assistant", text = deniedMsg))
                     if (ttsEnabled) voiceManager.speak(deniedMsg)
                 }
-            }
-        }
-    }
-
-    val micPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) {
-            beginVoiceCapture()
-        } else {
-            scope.launch {
-                dao.insertChat(
-                    ChatMessageEntity(
-                        role = "assistant",
-                        text = "⚠️ Microphone permission denied. Enable Microphone in App Info to use voice commands."
-                    )
-                )
             }
         }
     }
@@ -368,17 +363,36 @@ fun ChatPanel(
 
             FilledIconButton(
                 onClick = {
-                    if (isListening) {
-                        voiceManager.stopListening()
-                    } else {
-                        val hasMic = ContextCompat.checkSelfPermission(
-                            context,
-                            Manifest.permission.RECORD_AUDIO
-                        ) == PackageManager.PERMISSION_GRANTED
-                        if (hasMic) {
-                            beginVoiceCapture()
+                    try {
+                        if (isListening) {
+                            voiceManager.stopListening()
                         } else {
-                            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                            val hasMic = ContextCompat.checkSelfPermission(
+                                context,
+                                Manifest.permission.RECORD_AUDIO
+                            ) == PackageManager.PERMISSION_GRANTED
+                            if (hasMic) {
+                                beginVoiceCapture()
+                            } else {
+                                val activity = context as? Activity
+                                if (activity != null) {
+                                    securityManager.suppressNextAutoLock()
+                                    ActivityCompat.requestPermissions(
+                                        activity,
+                                        arrayOf(Manifest.permission.RECORD_AUDIO),
+                                        1001
+                                    )
+                                }
+                            }
+                        }
+                    } catch (e: Throwable) {
+                        scope.launch {
+                            dao.insertChat(
+                                ChatMessageEntity(
+                                    role = "assistant",
+                                    text = "⚠️ Mic tap error: ${e.javaClass.simpleName} - ${e.message}"
+                                )
+                            )
                         }
                     }
                 },

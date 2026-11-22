@@ -34,6 +34,13 @@ class SecurityManager(context: Context) {
     private val _isUnlocked = MutableStateFlow(false)
     val isUnlocked: StateFlow<Boolean> = _isUnlocked.asStateFlow()
 
+    @Volatile
+    private var suppressNextLock = false
+
+    fun suppressNextAutoLock() {
+        suppressNextLock = true
+    }
+
     fun isPinSet(): Boolean = prefs.contains("pin_hash")
 
     fun isBiometricEnabled(): Boolean = prefs.getBoolean("biometric_enabled", false)
@@ -72,8 +79,26 @@ class SecurityManager(context: Context) {
     }
 
     fun lock() {
+        if (suppressNextLock) {
+            suppressNextLock = false
+            return
+        }
         _isUnlocked.value = false
     }
+
+    // --- Crash Diagnostics ---
+
+    fun saveLastCrashTrace(trace: String) {
+        prefs.edit().putString("last_crash_trace", trace).commit()
+    }
+
+    fun getLastCrashTrace(): String? = prefs.getString("last_crash_trace", null)
+
+    fun clearLastCrashTrace() {
+        prefs.edit().remove("last_crash_trace").apply()
+    }
+
+    // --- Cloud AI & Voice Config ---
 
     fun getUserName(): String = prefs.getString("user_name", "Boss") ?: "Boss"
 
