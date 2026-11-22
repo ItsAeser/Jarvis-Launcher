@@ -75,8 +75,6 @@ class SecurityManager(context: Context) {
         _isUnlocked.value = false
     }
 
-    // --- Cloud AI & Personalization Config (Encrypted in Keystore) ---
-
     fun getUserName(): String = prefs.getString("user_name", "Boss") ?: "Boss"
 
     fun setUserName(name: String) {
@@ -84,14 +82,15 @@ class SecurityManager(context: Context) {
     }
 
     fun getApiBaseUrl(): String =
-        prefs.getString("api_base_url", "https://openrouter.ai/api/v1") ?: "https://openrouter.ai/api/v1"
+        prefs.getString("api_base_url", "https://generativelanguage.googleapis.com/v1beta/openai")
+            ?: "https://generativelanguage.googleapis.com/v1beta/openai"
 
     fun setApiBaseUrl(url: String) {
         prefs.edit().putString("api_base_url", url.trim().removeSuffix("/")).apply()
     }
 
     fun getApiModel(): String =
-        prefs.getString("api_model", "google/gemini-2.5-flash") ?: "google/gemini-2.5-flash"
+        prefs.getString("api_model", "gemini-3.5-flash-lite") ?: "gemini-3.5-flash-lite"
 
     fun setApiModel(model: String) {
         prefs.edit().putString("api_model", model.trim()).apply()
@@ -101,6 +100,12 @@ class SecurityManager(context: Context) {
 
     fun setApiKey(key: String) {
         prefs.edit().putString("api_key", key.trim()).apply()
+    }
+
+    fun isTtsEnabled(): Boolean = prefs.getBoolean("tts_enabled", true)
+
+    fun setTtsEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean("tts_enabled", enabled).apply()
     }
 
     fun isCloudConfigured(): Boolean = getApiKey().isNotBlank() && getApiBaseUrl().isNotBlank()

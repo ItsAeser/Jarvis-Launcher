@@ -1,5 +1,7 @@
 package com.privateai.jarvis.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -11,44 +13,123 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.automirrored.filled.VolumeOff
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DeleteSweep
+import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Security
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import com.privateai.jarvis.ai.CloudChatClient
 import com.privateai.jarvis.ai.ToolRequest
 import com.privateai.jarvis.data.ChatMessageEntity
 import com.privateai.jarvis.data.VaultDao
+import com.privateai.jarvis.security.SecurityManager
 import com.privateai.jarvis.tools.PendingToolAction
 import com.privateai.jarvis.tools.ToolExecutionOutcome
 import com.privateai.jarvis.tools.ToolExecutor
+import com.privateai.jarvis.voice.VoiceAssistantManager
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 
 @Composable
 fun ChatPanel(
     dao: VaultDao,
+    securityManager: SecurityManager,
     chatClient: CloudChatClient,
     toolExecutor: ToolExecutor,
+    voiceManager: VoiceAssistantManager,
     installedAppNames: List<String>,
     onOpenSettings: () -> Unit
 ) {
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val messages by dao.observeChat().collectAsState(initial = emptyList())
     val listState = rememberLazyListState()
     var input by remember { mutableStateOf("") }
     var isSending by remember { mutableStateOf(false) }
+    var ttsEnabled by remember { mutableStateOf(securityManager.isTtsEnabled()) }
     var pendingConfirmation by remember { mutableStateOf<PendingToolAction?>(null) }
     var pendingPermissionTool by remember { mutableStateOf<ToolRequest?>(null) }
+
+    val isListening by voiceManager.isListening.collectAsState()
+    val partialVoice by voiceManager.partialText.collectAsState()
+    val voiceError by voiceManager.voiceError.collectAsState()
+
+    val submitPrompt: (String) -> Unit = { rawText ->
+        val prompt = rawText.trim()
+        if (prompt.isNotEmpty() && !isSending) {
+            input = ""
+            isSending = true
+            scope.launch {
+                dao.insertChat(ChatMessageEntity(role = "user", text = prompt))
+
+                // Fast local rule: "open <app>" or "launch <app>" executes immediately
+                val localOpenMatch = Regex("^(?:open|launch|start)\\s+(.+)$", RegexOption.IGNORE_CASE)
+                    .matchEntire(prompt)
+                if (localOpenMatch != null) {
+                    val targetApp = localOpenMatch.groupValues[1].trim()
+                    val req = ToolRequest(
+                        tool = "open_app",
+                        args = JSONObject().put("app_name", targetApp)
+                    )
+                    val outcome = toolExecutor.handleToolRequest(req, confirmed = false)
+                    handleOutcome(
+                        outcome = outcome,
+                        dao = dao,
+                        speakReply = { if (ttsEnabled) voiceManager.speak(it) },
+                        onNeedConfirm = { pendingConfirmation = it },
+                        onNeedPermission = { _, _ -> }
+                    )
+                    isSending = false
+                    return@launch
+                }
+
+                val result = chatClient.sendMessage(messages, prompt, installedAppNames)
+                result.fold(
+                    onSuccess = { turn ->
+                        if (turn.toolRequest != null) {
+                            val outcome = toolExecutor.handleToolRequest(
+                                request = turn.toolRequest,
+                                confirmed = false
+                            )
+                            handleOutcome(
+                                outcome = outcome,
+                                dao = dao,
+                                speakReply = { if (ttsEnabled) voiceManager.speak(it) },
+                                onNeedConfirm = { pendingConfirmation = it },
+                                onNeedPermission = { perms, req ->
+                                    pendingPermissionTool = req
+                                    // Handled via permissionLauncher below
+                                }
+                            )
+                        } else {
+                            dao.insertChat(ChatMessageEntity(role = "assistant", text = turn.replyText))
+                            if (ttsEnabled) voiceManager.speak(turn.replyText)
+                        }
+                    },
+                    onFailure = { err ->
+                        val msg = "⚠️ ${err.message ?: "Request failed."}"
+                        dao.insertChat(ChatMessageEntity(role = "assistant", text = msg))
+                        if (ttsEnabled) voiceManager.speak(msg)
+                    }
+                )
+                isSending = false
+            }
+        }
+    }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
@@ -62,22 +143,34 @@ fun ChatPanel(
                     handleOutcome(
                         outcome = toolExecutor.handleToolRequest(toolToRetry, confirmed = false),
                         dao = dao,
+                        speakReply = { if (ttsEnabled) voiceManager.speak(it) },
                         onNeedConfirm = { pendingConfirmation = it },
                         onNeedPermission = { _, _ -> }
                     )
                 } else {
-                    dao.insertChat(
-                        ChatMessageEntity(
-                            role = "assistant",
-                            text = "⚠️ Permission denied. I cannot complete that action without Android's permission."
-                        )
-                    )
+                    val deniedMsg = "⚠️ Permission denied. I cannot complete that action without Android's permission."
+                    dao.insertChat(ChatMessageEntity(role = "assistant", text = deniedMsg))
+                    if (ttsEnabled) voiceManager.speak(deniedMsg)
                 }
             }
         }
     }
 
+    val micPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            voiceManager.startListening { spoken -> submitPrompt(spoken) }
+        }
+    }
+
     val greetingText = remember(messages.size) { chatClient.buildGreeting() }
+
+    LaunchedEffect(Unit) {
+        if (ttsEnabled && messages.isEmpty()) {
+            voiceManager.speak(greetingText)
+        }
+    }
 
     LaunchedEffect(messages.size, pendingConfirmation) {
         if (messages.isNotEmpty()) {
@@ -101,7 +194,13 @@ fun ChatPanel(
             item(key = "greeting_header") {
                 GreetingCard(
                     greeting = greetingText,
+                    ttsEnabled = ttsEnabled,
                     hasHistory = messages.isNotEmpty(),
+                    onToggleTts = {
+                        ttsEnabled = !ttsEnabled
+                        securityManager.setTtsEnabled(ttsEnabled)
+                        if (!ttsEnabled) voiceManager.stopSpeaking()
+                    },
                     onClearHistory = { scope.launch { dao.clearChat() } },
                     onOpenSettings = onOpenSettings
                 )
@@ -122,6 +221,7 @@ fun ChatPanel(
                                 handleOutcome(
                                     outcome = toolExecutor.handleToolRequest(pending.request, confirmed = true),
                                     dao = dao,
+                                    speakReply = { if (ttsEnabled) voiceManager.speak(it) },
                                     onNeedConfirm = { pendingConfirmation = it },
                                     onNeedPermission = { perms, req ->
                                         pendingPermissionTool = req
@@ -134,12 +234,9 @@ fun ChatPanel(
                             pendingConfirmation = null
                             scope.launch {
                                 toolExecutor.logDenied(pending)
-                                dao.insertChat(
-                                    ChatMessageEntity(
-                                        role = "assistant",
-                                        text = "Action cancelled and logged."
-                                    )
-                                )
+                                val cancelMsg = "Action cancelled and logged."
+                                dao.insertChat(ChatMessageEntity(role = "assistant", text = cancelMsg))
+                                if (ttsEnabled) voiceManager.speak(cancelMsg)
                             }
                         }
                     )
@@ -168,7 +265,38 @@ fun ChatPanel(
             }
         }
 
-        // Prompt Input Bar: imePadding() lifts it cleanly above the keyboard and drops it back down on dismiss
+        if (isListening || voiceError != null) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFF172033), RoundedCornerShape(12.dp))
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (isListening) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(14.dp),
+                        strokeWidth = 2.dp,
+                        color = Color(0xFFF87171)
+                    )
+                    Text(
+                        text = if (partialVoice.isNotEmpty()) partialVoice else "Listening... speak your command",
+                        color = Color(0xFF38BDF8),
+                        fontSize = 13.sp
+                    )
+                } else if (voiceError != null) {
+                    Text(
+                        text = voiceError!!,
+                        color = Color(0xFFF87171),
+                        fontSize = 12.sp
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(6.dp))
+        }
+
+        // Prompt Input Bar + Voice Mic Button
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -181,7 +309,7 @@ fun ChatPanel(
                 value = input,
                 onValueChange = { input = it },
                 modifier = Modifier.weight(1f),
-                placeholder = { Text("Command J.A.R.V.I.S. (e.g. Open YouTube)...", color = Color(0xFF64748B)) },
+                placeholder = { Text("Ask or tap mic...", color = Color(0xFF64748B)) },
                 maxLines = 4,
                 shape = RoundedCornerShape(16.dp),
                 colors = OutlinedTextFieldDefaults.colors(
@@ -196,72 +324,36 @@ fun ChatPanel(
 
             FilledIconButton(
                 onClick = {
-                    val prompt = input.trim()
-                    if (prompt.isNotEmpty() && !isSending) {
-                        input = ""
-                        isSending = true
-                        scope.launch {
-                            dao.insertChat(ChatMessageEntity(role = "user", text = prompt))
-
-                            // Fast local rule: "open <app>" or "launch <app>" executes immediately without waiting on cloud LLM
-                            val localOpenMatch = Regex("^(?:open|launch|start)\\s+(.+)$", RegexOption.IGNORE_CASE)
-                                .matchEntire(prompt)
-                            if (localOpenMatch != null) {
-                                val targetApp = localOpenMatch.groupValues[1].trim()
-                                val req = ToolRequest(
-                                    tool = "open_app",
-                                    args = JSONObject().put("app_name", targetApp)
-                                )
-                                val outcome = toolExecutor.handleToolRequest(req, confirmed = false)
-                                handleOutcome(
-                                    outcome = outcome,
-                                    dao = dao,
-                                    onNeedConfirm = { pendingConfirmation = it },
-                                    onNeedPermission = { perms, r ->
-                                        pendingPermissionTool = r
-                                        permissionLauncher.launch(perms.toTypedArray())
-                                    }
-                                )
-                                isSending = false
-                                return@launch
-                            }
-
-                            val result = chatClient.sendMessage(messages, prompt, installedAppNames)
-                            result.fold(
-                                onSuccess = { turn ->
-                                    if (turn.toolRequest != null) {
-                                        val outcome = toolExecutor.handleToolRequest(
-                                            request = turn.toolRequest,
-                                            confirmed = false
-                                        )
-                                        handleOutcome(
-                                            outcome = outcome,
-                                            dao = dao,
-                                            onNeedConfirm = { pendingConfirmation = it },
-                                            onNeedPermission = { perms, req ->
-                                                pendingPermissionTool = req
-                                                permissionLauncher.launch(perms.toTypedArray())
-                                            }
-                                        )
-                                    } else {
-                                        dao.insertChat(ChatMessageEntity(role = "assistant", text = turn.replyText))
-                                    }
-                                },
-                                onFailure = { err ->
-                                    dao.insertChat(
-                                        ChatMessageEntity(
-                                            role = "assistant",
-                                            text = "⚠️ ${err.message ?: "Request failed."}"
-                                        )
-                                    )
-                                }
-                            )
-                            isSending = false
+                    if (isListening) {
+                        voiceManager.stopListening()
+                    } else {
+                        val hasMic = ContextCompat.checkSelfPermission(
+                            context,
+                            Manifest.permission.RECORD_AUDIO
+                        ) == PackageManager.PERMISSION_GRANTED
+                        if (hasMic) {
+                            voiceManager.startListening { spoken -> submitPrompt(spoken) }
+                        } else {
+                            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
                         }
                     }
                 },
+                modifier = Modifier.size(50.dp),
+                colors = IconButtonDefaults.filledIconButtonColors(
+                    containerColor = if (isListening) Color(0xFFDC2626) else Color(0xFF1E293B),
+                    contentColor = if (isListening) Color.White else Color(0xFF38BDF8)
+                )
+            ) {
+                Icon(
+                    imageVector = if (isListening) Icons.Default.Stop else Icons.Default.Mic,
+                    contentDescription = if (isListening) "Stop Listening" else "Voice Command"
+                )
+            }
+
+            FilledIconButton(
+                onClick = { submitPrompt(input) },
                 enabled = input.isNotBlank() && !isSending,
-                modifier = Modifier.size(52.dp),
+                modifier = Modifier.size(50.dp),
                 colors = IconButtonDefaults.filledIconButtonColors(
                     containerColor = Color(0xFF0284C7),
                     contentColor = Color.White
@@ -276,14 +368,17 @@ fun ChatPanel(
 private suspend fun handleOutcome(
     outcome: ToolExecutionOutcome,
     dao: VaultDao,
+    speakReply: (String) -> Unit,
     onNeedConfirm: (PendingToolAction) -> Unit,
     onNeedPermission: (List<String>, ToolRequest) -> Unit
 ) {
     when (outcome) {
         is ToolExecutionOutcome.Completed -> {
             dao.insertChat(ChatMessageEntity(role = "assistant", text = outcome.message))
+            speakReply(outcome.message)
         }
         is ToolExecutionOutcome.NeedsConfirmation -> {
+            speakReply("Confirmation required: ${outcome.pendingAction.title}")
             onNeedConfirm(outcome.pendingAction)
         }
         is ToolExecutionOutcome.NeedsPermission -> {
@@ -356,7 +451,9 @@ private fun ConfirmationCard(
 @Composable
 private fun GreetingCard(
     greeting: String,
+    ttsEnabled: Boolean,
     hasHistory: Boolean,
+    onToggleTts: () -> Unit,
     onClearHistory: () -> Unit,
     onOpenSettings: () -> Unit
 ) {
@@ -384,25 +481,39 @@ private fun GreetingCard(
                     modifier = Modifier.size(18.dp)
                 )
                 Text(
-                    text = "J.A.R.V.I.S. CORE",
+                    text = "J.A.R.V.I.S. VOICE + CORE",
                     color = Color(0xFF38BDF8),
                     fontSize = 12.sp,
                     fontWeight = FontWeight.Bold,
-                    letterSpacing = 1.5.sp
+                    letterSpacing = 1.3.sp
                 )
             }
 
-            if (hasHistory) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
                 IconButton(
-                    onClick = onClearHistory,
+                    onClick = onToggleTts,
                     modifier = Modifier.size(28.dp)
                 ) {
                     Icon(
-                        imageVector = Icons.Default.DeleteSweep,
-                        contentDescription = "Clear encrypted chat",
-                        tint = Color(0xFF64748B),
+                        imageVector = if (ttsEnabled) Icons.AutoMirrored.Filled.VolumeUp else Icons.AutoMirrored.Filled.VolumeOff,
+                        contentDescription = "Toggle Voice Replies",
+                        tint = if (ttsEnabled) Color(0xFF38BDF8) else Color(0xFF64748B),
                         modifier = Modifier.size(18.dp)
                     )
+                }
+
+                if (hasHistory) {
+                    IconButton(
+                        onClick = onClearHistory,
+                        modifier = Modifier.size(28.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.DeleteSweep,
+                            contentDescription = "Clear encrypted chat",
+                            tint = Color(0xFF64748B),
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
                 }
             }
         }

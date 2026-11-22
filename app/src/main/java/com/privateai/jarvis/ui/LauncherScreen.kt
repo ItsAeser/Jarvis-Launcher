@@ -48,6 +48,7 @@ import com.privateai.jarvis.launcher.AppRepository
 import com.privateai.jarvis.launcher.InstalledApp
 import com.privateai.jarvis.security.SecurityManager
 import com.privateai.jarvis.tools.ToolExecutor
+import com.privateai.jarvis.voice.VoiceAssistantManager
 import kotlinx.coroutines.launch
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
@@ -62,8 +63,13 @@ fun LauncherScreen(
     val dao = remember { database.vaultDao() }
     val chatClient = remember { CloudChatClient(context, securityManager) }
     val toolExecutor = remember { ToolExecutor(context, appRepo, dao) }
+    val voiceManager = remember { VoiceAssistantManager(context) }
 
-    var selectedTab by remember { mutableIntStateOf(0) } // 0 = Agent, 1 = Apps, 2 = Logs/Vault
+    DisposableEffect(Unit) {
+        onDispose { voiceManager.release() }
+    }
+
+    var selectedTab by remember { mutableIntStateOf(0) }
     var allApps by remember { mutableStateOf<List<InstalledApp>>(emptyList()) }
     var searchQuery by remember { mutableStateOf("") }
     var showSetupSheet by remember { mutableStateOf(false) }
@@ -112,7 +118,7 @@ fun LauncherScreen(
                         letterSpacing = 2.5.sp
                     )
                     Text(
-                        text = if (securityManager.isCloudConfigured()) "Vault Encrypted • 5 Tools Active" else "Vault Encrypted • Setup Cloud Key",
+                        text = if (securityManager.isCloudConfigured()) "Vault Encrypted • Voice & Tools Ready" else "Vault Encrypted • Setup Cloud Key",
                         color = Color(0xFF64748B),
                         fontSize = 11.sp
                     )
@@ -194,8 +200,10 @@ fun LauncherScreen(
             when (selectedTab) {
                 0 -> ChatPanel(
                     dao = dao,
+                    securityManager = securityManager,
                     chatClient = chatClient,
                     toolExecutor = toolExecutor,
+                    voiceManager = voiceManager,
                     installedAppNames = allApps.map { it.label },
                     onOpenSettings = { showSetupSheet = true }
                 )
