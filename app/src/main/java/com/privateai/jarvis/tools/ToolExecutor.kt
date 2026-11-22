@@ -6,9 +6,12 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
+import android.os.Environment
 import android.provider.AlarmClock
 import android.provider.CalendarContract
 import android.provider.ContactsContract
+import android.provider.MediaStore
 import android.telephony.SmsManager
 import androidx.core.content.ContextCompat
 import com.privateai.jarvis.ai.ToolRequest
@@ -47,7 +50,8 @@ class ToolExecutor(
             "set_alarm",
             "create_note",
             "calendar",
-            "send_message"
+            "send_message",
+            "search_files"
         )
     }
 
@@ -69,6 +73,7 @@ class ToolExecutor(
             "create_note" -> executeCreateNote(request)
             "calendar" -> executeCalendar(request, confirmed)
             "send_message" -> executeSendMessage(request, confirmed)
+            "search_files" -> executeSearchFiles(request)
             else -> ToolExecutionOutcome.Completed("Blocked unknown tool.")
         }
     }
@@ -87,34 +92,16 @@ class ToolExecutor(
         }
 
         if (partial == null) {
-            dao.insertLog(
-                ActionLogEntity(
-                    toolName = "open_app",
-                    summary = "App not found: $query",
-                    status = "FAILED"
-                )
-            )
+            dao.insertLog(ActionLogEntity(toolName = "open_app", summary = "App not found: $query", status = "FAILED"))
             return ToolExecutionOutcome.Completed("I couldn't find an installed app matching \"$query\".")
         }
 
         val launched = appRepository.launchApp(partial.packageName)
         return if (launched) {
-            dao.insertLog(
-                ActionLogEntity(
-                    toolName = "open_app",
-                    summary = "Opened ${partial.label} (${partial.packageName})",
-                    status = "EXECUTED"
-                )
-            )
+            dao.insertLog(ActionLogEntity(toolName = "open_app", summary = "Opened ${partial.label}", status = "EXECUTED"))
             ToolExecutionOutcome.Completed("Opened ${partial.label}.")
         } else {
-            dao.insertLog(
-                ActionLogEntity(
-                    toolName = "open_app",
-                    summary = "Failed to launch ${partial.label}",
-                    status = "FAILED"
-                )
-            )
+            dao.insertLog(ActionLogEntity(toolName = "open_app", summary = "Failed to launch ${partial.label}", status = "FAILED"))
             ToolExecutionOutcome.Completed("Found ${partial.label}, but Android prevented launching it.")
         }
     }
@@ -139,22 +126,10 @@ class ToolExecutor(
         return try {
             context.startActivity(intent)
             val formattedTime = String.format(Locale.ROOT, "%02d:%02d", hour, minute)
-            dao.insertLog(
-                ActionLogEntity(
-                    toolName = "set_alarm",
-                    summary = "Set alarm for $formattedTime ($label)",
-                    status = "EXECUTED"
-                )
-            )
+            dao.insertLog(ActionLogEntity(toolName = "set_alarm", summary = "Set alarm for $formattedTime ($label)", status = "EXECUTED"))
             ToolExecutionOutcome.Completed("⏰ Alarm set for $formattedTime ($label).")
         } catch (e: Exception) {
-            dao.insertLog(
-                ActionLogEntity(
-                    toolName = "set_alarm",
-                    summary = "Failed to set alarm: ${e.message}",
-                    status = "FAILED"
-                )
-            )
+            dao.insertLog(ActionLogEntity(toolName = "set_alarm", summary = "Failed to set alarm: ${e.message}", status = "FAILED"))
             ToolExecutionOutcome.Completed("Could not set alarm: ${e.message}")
         }
     }
@@ -167,14 +142,64 @@ class ToolExecutor(
         }
 
         dao.insertNote(NoteEntity(title = title, content = content))
+        dao.insertLog(ActionLogEntity(toolName = "create_note", summary = "Saved encrypted note: $title", status = "EXECUTED"))
+        return ToolExecutionOutcome.Completed("📝 Saved encrypted note \"$title\" to your vault.")
+    }
+
+    private suspend fun executeSearchFiles(request: ToolRequest): ToolExecutionOutcome = withContext(Dispatchers.IO) {
+        val query = request.args.optString("query").trim()
+        if (query.isEmpty()) {
+            return@withContext ToolExecutionOutcome.Completed("Please provide a filename or keyword to search.")
+        }
+
+        val matches = mutableListOf<String>()
+        val uri = MediaStore.Files.getContentUri("external")
+        val projection = arrayOf(
+            MediaStore.Files.FileColumns.DISPLAY_NAME,
+            MediaStore.Files.FileColumns.RELATIVE_PATH
+        )
+
+        try {
+            context.contentResolver.query(
+                uri,
+                projection,
+                "${MediaStore.Files.FileColumns.DISPLAY_NAME} LIKE ?",
+                arrayOf("%$query%"),
+                "${MediaStore.Files.FileColumns.DATE_MODIFIED} DESC"
+            )?.use { cursor ->
+                while (cursor.moveToNext() && matches.size < 10) {
+                    val name = cursor.getString(0) ?: continue
+                    val rel = cursor.getString(1).orEmpty()
+                    matches.add("• $rel$name")
+                }
+            }
+        } catch (_: Throwable) {
+        }
+
+        // Also scan Downloads directory directly
+        val dlDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        if (dlDir.exists()) {
+            dlDir.listFiles()?.forEach { f ->
+                if (f.name.contains(query, ignoreCase = true) && matches.size < 12) {
+                    val entry = "• Download/${f.name}"
+                    if (entry !in matches) matches.add(entry)
+                }
+            }
+        }
+
         dao.insertLog(
             ActionLogEntity(
-                toolName = "create_note",
-                summary = "Saved encrypted note: $title",
+                toolName = "search_files",
+                summary = "Searched files for '$query' (${matches.size} matches)",
                 status = "EXECUTED"
             )
         )
-        return ToolExecutionOutcome.Completed("📝 Saved encrypted note \"$title\" to your vault.")
+
+        if (matches.isEmpty()) {
+            ToolExecutionOutcome.Completed("📂 No files matching \"$query\" found on device.")
+        } else {
+            ToolExecutionOutcome.Completed("📂 Found ${matches.size} file(s):\n" + matches.joinToString("\n"))
+        }
     }
 
     private suspend fun executeCalendar(
@@ -223,13 +248,7 @@ class ToolExecutor(
             }
             val uri = context.contentResolver.insert(CalendarContract.Events.CONTENT_URI, values)
             return@withContext if (uri != null) {
-                dao.insertLog(
-                    ActionLogEntity(
-                        toolName = "calendar",
-                        summary = "Added calendar event: $title ($dateTimeStr)",
-                        status = "EXECUTED"
-                    )
-                )
+                dao.insertLog(ActionLogEntity(toolName = "calendar", summary = "Added calendar event: $title", status = "EXECUTED"))
                 ToolExecutionOutcome.Completed("📅 Added \"$title\" to your calendar.")
             } else {
                 ToolExecutionOutcome.Completed("Failed to insert calendar event.")
@@ -237,10 +256,7 @@ class ToolExecutor(
         } else {
             val now = System.currentTimeMillis()
             val weekLater = now + 7L * 24 * 60 * 60 * 1000
-            val projection = arrayOf(
-                CalendarContract.Events.TITLE,
-                CalendarContract.Events.DTSTART
-            )
+            val projection = arrayOf(CalendarContract.Events.TITLE, CalendarContract.Events.DTSTART)
             val selection = "${CalendarContract.Events.DTSTART} >= ? AND ${CalendarContract.Events.DTSTART} <= ?"
             val selectionArgs = arrayOf(now.toString(), weekLater.toString())
             val events = mutableListOf<String>()
@@ -260,13 +276,7 @@ class ToolExecutor(
                 }
             }
 
-            dao.insertLog(
-                ActionLogEntity(
-                    toolName = "calendar",
-                    summary = "Read ${events.size} upcoming calendar events",
-                    status = "EXECUTED"
-                )
-            )
+            dao.insertLog(ActionLogEntity(toolName = "calendar", summary = "Read ${events.size} calendar events", status = "EXECUTED"))
             val reply = if (events.isEmpty()) {
                 "📅 You have no calendar events scheduled for the next 7 days."
             } else {
@@ -319,13 +329,7 @@ class ToolExecutor(
         return@withContext try {
             val smsManager = context.getSystemService(SmsManager::class.java)
             smsManager.sendTextMessage(resolvedNumber, null, messageBody, null, null)
-            dao.insertLog(
-                ActionLogEntity(
-                    toolName = "send_message",
-                    summary = "Sent SMS to $recipientRaw ($resolvedNumber)",
-                    status = "EXECUTED"
-                )
-            )
+            dao.insertLog(ActionLogEntity(toolName = "send_message", summary = "Sent SMS to $recipientRaw", status = "EXECUTED"))
             ToolExecutionOutcome.Completed("✉️ SMS sent to $recipientRaw ($resolvedNumber).")
         } catch (e: Exception) {
             val smsIntent = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:$resolvedNumber")).apply {
@@ -333,13 +337,7 @@ class ToolExecutor(
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
             context.startActivity(smsIntent)
-            dao.insertLog(
-                ActionLogEntity(
-                    toolName = "send_message",
-                    summary = "Opened SMS app for $recipientRaw (restricted direct send)",
-                    status = "EXECUTED"
-                )
-            )
+            dao.insertLog(ActionLogEntity(toolName = "send_message", summary = "Opened SMS app for $recipientRaw", status = "EXECUTED"))
             ToolExecutionOutcome.Completed("Opened Messages with your pre-filled text to $recipientRaw.")
         }
     }

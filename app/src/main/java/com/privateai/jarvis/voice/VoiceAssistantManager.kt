@@ -4,6 +4,8 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -16,11 +18,16 @@ import java.util.Locale
 class VoiceAssistantManager(private val context: Context) {
 
     private var speechRecognizer: SpeechRecognizer? = null
+    private var wakeRecognizer: SpeechRecognizer? = null
     private var tts: TextToSpeech? = null
     private var ttsReady = false
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     private val _isListening = MutableStateFlow(false)
     val isListening: StateFlow<Boolean> = _isListening.asStateFlow()
+
+    private val _isWakeWordActive = MutableStateFlow(false)
+    val isWakeWordActive: StateFlow<Boolean> = _isWakeWordActive.asStateFlow()
 
     private val _partialText = MutableStateFlow("")
     val partialText: StateFlow<String> = _partialText.asStateFlow()
@@ -30,6 +37,8 @@ class VoiceAssistantManager(private val context: Context) {
 
     private val _voiceError = MutableStateFlow<String?>(null)
     val voiceError: StateFlow<String?> = _voiceError.asStateFlow()
+
+    private var wakeCallback: ((String?) -> Unit)? = null
 
     init {
         try {
@@ -41,16 +50,122 @@ class VoiceAssistantManager(private val context: Context) {
                     tts?.setSpeechRate(1.04f)
                 }
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             ttsReady = false
         }
     }
 
     /**
-     * Tries explicit Google Speech Services first (avoids HyperOS / Android System Intelligence
-     * binding crashes on Android 16), then falls back to default SpeechRecognizer, and finally
-     * signals false if inline recognition cannot bind so the UI can launch system voice dialog.
+     * Continuous wake-word loop listening for "Jarvis".
+     * If user says "Jarvis open YouTube", passes "open YouTube" immediately.
+     * If user says only "Jarvis", passes null so UI triggers active command capture.
      */
+    fun startWakeWordDetection(onWakeTriggered: (String?) -> Unit) {
+        wakeCallback = onWakeTriggered
+        _isWakeWordActive.value = true
+        scheduleWakeCycle(250L)
+    }
+
+    fun stopWakeWordDetection() {
+        _isWakeWordActive.value = false
+        wakeCallback = null
+        mainHandler.removeCallbacksAndMessages(null)
+        try {
+            wakeRecognizer?.stopListening()
+            wakeRecognizer?.destroy()
+        } catch (_: Throwable) {
+        }
+        wakeRecognizer = null
+    }
+
+    private fun scheduleWakeCycle(delayMs: Long) {
+        if (!_isWakeWordActive.value || _isListening.value) return
+        mainHandler.postDelayed({
+            if (!_isWakeWordActive.value || _isListening.value) return@postDelayed
+            runSingleWakePass()
+        }, delayMs)
+    }
+
+    private fun runSingleWakePass() {
+        try {
+            wakeRecognizer?.destroy()
+        } catch (_: Throwable) {
+        }
+        val recognizer = createSafeRecognizer()
+        if (recognizer == null) {
+            _isWakeWordActive.value = false
+            _voiceError.value = "Wake-word unavailable on this speech engine."
+            return
+        }
+        wakeRecognizer = recognizer
+
+        try {
+            recognizer.setRecognitionListener(object : RecognitionListener {
+                override fun onReadyForSpeech(params: Bundle?) {}
+                override fun onBeginningOfSpeech() {}
+                override fun onRmsChanged(rmsdB: Float) {}
+                override fun onBufferReceived(buffer: ByteArray?) {}
+                override fun onEndOfSpeech() {}
+
+                override fun onError(error: Int) {
+                    scheduleWakeCycle(700L)
+                }
+
+                override fun onResults(results: Bundle?) {
+                    val heard = results
+                        ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        ?.firstOrNull()
+                        ?.trim()
+                        .orEmpty()
+                    handleWakeTranscript(heard)
+                }
+
+                override fun onPartialResults(partialResults: Bundle?) {
+                    val partial = partialResults
+                        ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        ?.firstOrNull()
+                        ?.trim()
+                        .orEmpty()
+                    if (partial.equals("jarvis", ignoreCase = true) ||
+                        partial.equals("hey jarvis", ignoreCase = true)
+                    ) {
+                        try {
+                            recognizer.stopListening()
+                        } catch (_: Throwable) {
+                        }
+                        handleWakeTranscript(partial)
+                    }
+                }
+
+                override fun onEvent(eventType: Int, params: Bundle?) {}
+            })
+
+            recognizer.startListening(buildRecognizerIntent(silentPrompt = true))
+        } catch (_: Throwable) {
+            scheduleWakeCycle(1200L)
+        }
+    }
+
+    private fun handleWakeTranscript(transcript: String) {
+        val lower = transcript.lowercase(Locale.ROOT)
+        val wakeRegex = Regex("^(?:hey\\s+|ok\\s+)?jarvis[,\\s]*(.*)$", RegexOption.IGNORE_CASE)
+        val match = wakeRegex.matchEntire(lower)
+        if (match != null) {
+            val trailingCommand = transcript
+                .replace(Regex("^(?:hey\\s+|ok\\s+)?jarvis[,\\s]*", RegexOption.IGNORE_CASE), "")
+                .trim()
+            if (trailingCommand.isNotEmpty()) {
+                wakeCallback?.invoke(trailingCommand)
+                scheduleWakeCycle(1500L)
+            } else {
+                speak("Yes?")
+                wakeCallback?.invoke(null)
+            }
+        } else {
+            scheduleWakeCycle(400L)
+        }
+    }
+
     fun startListening(
         onFinalResult: (String) -> Unit,
         onFallbackToSystemDialog: () -> Unit
@@ -58,6 +173,10 @@ class VoiceAssistantManager(private val context: Context) {
         _voiceError.value = null
         stopSpeaking()
         stopListening()
+        try {
+            wakeRecognizer?.stopListening()
+        } catch (_: Throwable) {
+        }
 
         val recognizer = createSafeRecognizer()
         if (recognizer == null) {
@@ -75,9 +194,7 @@ class VoiceAssistantManager(private val context: Context) {
                 }
 
                 override fun onBeginningOfSpeech() {}
-
                 override fun onRmsChanged(rmsdB: Float) {}
-
                 override fun onBufferReceived(buffer: ByteArray?) {}
 
                 override fun onEndOfSpeech() {
@@ -92,9 +209,9 @@ class VoiceAssistantManager(private val context: Context) {
                         SpeechRecognizer.ERROR_SPEECH_TIMEOUT,
                         SpeechRecognizer.ERROR_NO_MATCH -> {
                             _voiceError.value = "Didn't catch that. Tap mic to try again."
+                            if (_isWakeWordActive.value) scheduleWakeCycle(800L)
                         }
                         else -> {
-                            // Service binding / HyperOS restriction error -> open standard voice dialog
                             stopListening()
                             onFallbackToSystemDialog()
                         }
@@ -112,6 +229,7 @@ class VoiceAssistantManager(private val context: Context) {
                     if (text.isNotEmpty()) {
                         onFinalResult(text)
                     }
+                    if (_isWakeWordActive.value) scheduleWakeCycle(1200L)
                 }
 
                 override fun onPartialResults(partialResults: Bundle?) {
@@ -127,42 +245,37 @@ class VoiceAssistantManager(private val context: Context) {
                 override fun onEvent(eventType: Int, params: Bundle?) {}
             })
 
-            val intent = buildRecognizerIntent()
-            recognizer.startListening(intent)
+            recognizer.startListening(buildRecognizerIntent(silentPrompt = false))
         } catch (_: Throwable) {
             stopListening()
             onFallbackToSystemDialog()
         }
     }
 
-    fun buildRecognizerIntent(): Intent {
+    fun buildRecognizerIntent(silentPrompt: Boolean = false): Intent {
         return Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(
-                RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-                RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
-            )
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-IN")
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-            putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak to J.A.R.V.I.S.")
+            if (!silentPrompt) {
+                putExtra(RecognizerIntent.EXTRA_PROMPT, "Speak to J.A.R.V.I.S.")
+            }
         }
     }
 
     private fun createSafeRecognizer(): SpeechRecognizer? {
-        // 1. Prefer Google Speech Services directly (prevents HyperOS / AiAiSpeechRecognition crash)
         try {
             val googleComponent = ComponentName(
                 "com.google.android.tts",
                 "com.google.android.apps.speech.tts.googletts.service.GoogleTTSRecognitionService"
             )
-            val pm = context.packageManager
-            if (pm.getServiceInfo(googleComponent, 0) != null) {
+            if (context.packageManager.getServiceInfo(googleComponent, 0) != null) {
                 return SpeechRecognizer.createSpeechRecognizer(context, googleComponent)
             }
         } catch (_: Throwable) {
         }
 
-        // 2. Try standard system recognizer if available
         return try {
             if (SpeechRecognizer.isRecognitionAvailable(context)) {
                 SpeechRecognizer.createSpeechRecognizer(context)
@@ -190,7 +303,7 @@ class VoiceAssistantManager(private val context: Context) {
     fun speak(text: String) {
         if (!ttsReady || text.isBlank()) return
         val clean = text
-            .replace(Regex("[*#`>⚠️🛡️⏰📝📅✉️]"), "")
+            .replace(Regex("[*#`>⚠️🛡️⏰📝📅✉️📴📂]"), "")
             .trim()
         if (clean.isEmpty()) return
 
@@ -211,6 +324,7 @@ class VoiceAssistantManager(private val context: Context) {
     }
 
     fun release() {
+        stopWakeWordDetection()
         stopListening()
         stopSpeaking()
         try {

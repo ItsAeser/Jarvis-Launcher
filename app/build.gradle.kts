@@ -13,8 +13,8 @@ android {
         applicationId = "com.privateai.jarvis"
         minSdk = 29
         targetSdk = 35
-        versionCode = 7
-        versionName = "1.0-step4.3"
+        versionCode = 8
+        versionName = "1.0-step5"
     }
 
     buildTypes {
@@ -70,4 +70,7 @@ dependencies {
 
     // Lightweight HTTPS client for Cloud AI / Proxy
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // On-device 4-bit LLM Inference (MediaPipe GenAI)
+    implementation("com.google.mediapipe:tasks-genai:0.10.22")
 }

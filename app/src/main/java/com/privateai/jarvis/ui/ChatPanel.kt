@@ -21,7 +21,9 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DeleteSweep
+import androidx.compose.material.icons.filled.Hearing
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.PrivacyTip
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.*
@@ -36,6 +38,9 @@ import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.privateai.jarvis.ai.CloudChatClient
+import com.privateai.jarvis.ai.HybridRouter
+import com.privateai.jarvis.ai.LocalLlmEngine
+import com.privateai.jarvis.ai.RouteDecision
 import com.privateai.jarvis.ai.ToolRequest
 import com.privateai.jarvis.data.ChatMessageEntity
 import com.privateai.jarvis.data.VaultDao
@@ -45,13 +50,14 @@ import com.privateai.jarvis.tools.ToolExecutionOutcome
 import com.privateai.jarvis.tools.ToolExecutor
 import com.privateai.jarvis.voice.VoiceAssistantManager
 import kotlinx.coroutines.launch
-import org.json.JSONObject
 
 @Composable
 fun ChatPanel(
     dao: VaultDao,
     securityManager: SecurityManager,
     chatClient: CloudChatClient,
+    localEngine: LocalLlmEngine,
+    hybridRouter: HybridRouter,
     toolExecutor: ToolExecutor,
     voiceManager: VoiceAssistantManager,
     installedAppNames: List<String>,
@@ -64,12 +70,41 @@ fun ChatPanel(
     var input by remember { mutableStateOf("") }
     var isSending by remember { mutableStateOf(false) }
     var ttsEnabled by remember { mutableStateOf(securityManager.isTtsEnabled()) }
+    var wakeEnabled by remember { mutableStateOf(securityManager.isWakeWordEnabled()) }
     var pendingConfirmation by remember { mutableStateOf<PendingToolAction?>(null) }
+    var pendingCloudPrivacyPrompt by remember { mutableStateOf<Pair<String, String>?>(null) }
     var pendingPermissionTool by remember { mutableStateOf<ToolRequest?>(null) }
 
     val isListening by voiceManager.isListening.collectAsState()
+    val isWakeActive by voiceManager.isWakeWordActive.collectAsState()
     val partialVoice by voiceManager.partialText.collectAsState()
     val voiceError by voiceManager.voiceError.collectAsState()
+
+    val runCloudQuery: suspend (String) -> Unit = { prompt ->
+        val result = chatClient.sendMessage(messages, prompt, installedAppNames)
+        result.fold(
+            onSuccess = { turn ->
+                if (turn.toolRequest != null) {
+                    val outcome = toolExecutor.handleToolRequest(turn.toolRequest, confirmed = false)
+                    handleOutcome(
+                        outcome = outcome,
+                        dao = dao,
+                        speakReply = { if (ttsEnabled) voiceManager.speak(it) },
+                        onNeedConfirm = { pendingConfirmation = it },
+                        onNeedPermission = { _, req -> pendingPermissionTool = req }
+                    )
+                } else {
+                    dao.insertChat(ChatMessageEntity(role = "assistant", text = turn.replyText))
+                    if (ttsEnabled) voiceManager.speak(turn.replyText)
+                }
+            },
+            onFailure = { err ->
+                val msg = "⚠️ ${err.message ?: "Request failed."}"
+                dao.insertChat(ChatMessageEntity(role = "assistant", text = msg))
+                if (ttsEnabled) voiceManager.speak(msg)
+            }
+        )
+    }
 
     val submitPrompt: (String) -> Unit = { rawText ->
         val prompt = rawText.trim()
@@ -79,54 +114,53 @@ fun ChatPanel(
             scope.launch {
                 dao.insertChat(ChatMessageEntity(role = "user", text = prompt))
 
-                val localOpenMatch = Regex("^(?:open|launch|start)\\s+(.+)$", RegexOption.IGNORE_CASE)
-                    .matchEntire(prompt)
-                if (localOpenMatch != null) {
-                    val targetApp = localOpenMatch.groupValues[1].trim()
-                    val req = ToolRequest(
-                        tool = "open_app",
-                        args = JSONObject().put("app_name", targetApp)
-                    )
-                    val outcome = toolExecutor.handleToolRequest(req, confirmed = false)
-                    handleOutcome(
-                        outcome = outcome,
-                        dao = dao,
-                        speakReply = { if (ttsEnabled) voiceManager.speak(it) },
-                        onNeedConfirm = { pendingConfirmation = it },
-                        onNeedPermission = { _, _ -> }
-                    )
-                    isSending = false
-                    return@launch
-                }
-
-                val result = chatClient.sendMessage(messages, prompt, installedAppNames)
-                result.fold(
-                    onSuccess = { turn ->
-                        if (turn.toolRequest != null) {
-                            val outcome = toolExecutor.handleToolRequest(
-                                request = turn.toolRequest,
-                                confirmed = false
-                            )
-                            handleOutcome(
-                                outcome = outcome,
-                                dao = dao,
-                                speakReply = { if (ttsEnabled) voiceManager.speak(it) },
-                                onNeedConfirm = { pendingConfirmation = it },
-                                onNeedPermission = { perms, req ->
-                                    pendingPermissionTool = req
-                                }
-                            )
-                        } else {
-                            dao.insertChat(ChatMessageEntity(role = "assistant", text = turn.replyText))
-                            if (ttsEnabled) voiceManager.speak(turn.replyText)
-                        }
-                    },
-                    onFailure = { err ->
-                        val msg = "⚠️ ${err.message ?: "Request failed."}"
-                        dao.insertChat(ChatMessageEntity(role = "assistant", text = msg))
-                        if (ttsEnabled) voiceManager.speak(msg)
+                when (val route = hybridRouter.decideRoute(prompt)) {
+                    is RouteDecision.DirectTool -> {
+                        val outcome = toolExecutor.handleToolRequest(route.request, confirmed = false)
+                        handleOutcome(
+                            outcome = outcome,
+                            dao = dao,
+                            speakReply = { if (ttsEnabled) voiceManager.speak(it) },
+                            onNeedConfirm = { pendingConfirmation = it },
+                            onNeedPermission = { _, req -> pendingPermissionTool = req }
+                        )
                     }
-                )
+                    is RouteDecision.Cloud -> {
+                        if (route.requiresPrivacyApproval) {
+                            pendingCloudPrivacyPrompt = Pair(prompt, route.privacySummary)
+                            if (ttsEnabled) {
+                                voiceManager.speak("Approval required before sending personal data online.")
+                            }
+                        } else {
+                            runCloudQuery(prompt)
+                        }
+                    }
+                    is RouteDecision.LocalFirst -> {
+                        val hybridRes = hybridRouter.executeHybrid(prompt, messages, installedAppNames)
+                        hybridRes.fold(
+                            onSuccess = { (turn, _) ->
+                                if (turn.toolRequest != null) {
+                                    val outcome = toolExecutor.handleToolRequest(turn.toolRequest, confirmed = false)
+                                    handleOutcome(
+                                        outcome = outcome,
+                                        dao = dao,
+                                        speakReply = { if (ttsEnabled) voiceManager.speak(it) },
+                                        onNeedConfirm = { pendingConfirmation = it },
+                                        onNeedPermission = { _, req -> pendingPermissionTool = req }
+                                    )
+                                } else {
+                                    dao.insertChat(ChatMessageEntity(role = "assistant", text = turn.replyText))
+                                    if (ttsEnabled) voiceManager.speak(turn.replyText)
+                                }
+                            },
+                            onFailure = { err ->
+                                val msg = "⚠️ ${err.message ?: "Local/Hybrid inference failed."}"
+                                dao.insertChat(ChatMessageEntity(role = "assistant", text = msg))
+                                if (ttsEnabled) voiceManager.speak(msg)
+                            }
+                        )
+                    }
+                }
                 isSending = false
             }
         }
@@ -160,22 +194,14 @@ fun ChatPanel(
                             dao.insertChat(
                                 ChatMessageEntity(
                                     role = "assistant",
-                                    text = "⚠️ Voice dialog unavailable (${e.javaClass.simpleName}): ${e.message}"
+                                    text = "⚠️ Voice dialog unavailable: ${e.message}"
                                 )
                             )
                         }
                     }
                 }
             )
-        } catch (e: Throwable) {
-            scope.launch {
-                dao.insertChat(
-                    ChatMessageEntity(
-                        role = "assistant",
-                        text = "⚠️ Voice error (${e.javaClass.simpleName}): ${e.message}"
-                    )
-                )
-            }
+        } catch (_: Throwable) {
         }
     }
 
@@ -196,11 +222,32 @@ fun ChatPanel(
                         onNeedPermission = { _, _ -> }
                     )
                 } else {
-                    val deniedMsg = "⚠️ Permission denied. I cannot complete that action without Android's permission."
-                    dao.insertChat(ChatMessageEntity(role = "assistant", text = deniedMsg))
-                    if (ttsEnabled) voiceManager.speak(deniedMsg)
+                    dao.insertChat(
+                        ChatMessageEntity(
+                            role = "assistant",
+                            text = "⚠️ Permission denied. Action aborted."
+                        )
+                    )
                 }
             }
+        }
+    }
+
+    LaunchedEffect(wakeEnabled) {
+        val hasMic = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+        if (wakeEnabled && hasMic) {
+            voiceManager.startWakeWordDetection { trailingCommand ->
+                if (!trailingCommand.isNullOrBlank()) {
+                    submitPrompt(trailingCommand)
+                } else {
+                    beginVoiceCapture()
+                }
+            }
+        } else {
+            voiceManager.stopWakeWordDetection()
         }
     }
 
@@ -212,7 +259,7 @@ fun ChatPanel(
         }
     }
 
-    LaunchedEffect(messages.size, pendingConfirmation) {
+    LaunchedEffect(messages.size, pendingConfirmation, pendingCloudPrivacyPrompt) {
         if (messages.isNotEmpty()) {
             listState.animateScrollToItem(messages.size)
         }
@@ -235,7 +282,23 @@ fun ChatPanel(
                 GreetingCard(
                     greeting = greetingText,
                     ttsEnabled = ttsEnabled,
+                    wakeWordEnabled = isWakeActive,
                     hasHistory = messages.isNotEmpty(),
+                    onToggleWakeWord = {
+                        val hasMic = ContextCompat.checkSelfPermission(
+                            context,
+                            Manifest.permission.RECORD_AUDIO
+                        ) == PackageManager.PERMISSION_GRANTED
+                        if (!hasMic) {
+                            (context as? Activity)?.let { act ->
+                                securityManager.suppressNextAutoLock()
+                                ActivityCompat.requestPermissions(act, arrayOf(Manifest.permission.RECORD_AUDIO), 1002)
+                            }
+                        } else {
+                            wakeEnabled = !wakeEnabled
+                            securityManager.setWakeWordEnabled(wakeEnabled)
+                        }
+                    },
                     onToggleTts = {
                         ttsEnabled = !ttsEnabled
                         securityManager.setTtsEnabled(ttsEnabled)
@@ -248,6 +311,34 @@ fun ChatPanel(
 
             items(messages, key = { it.id }) { msg ->
                 ChatBubble(message = msg)
+            }
+
+            if (pendingCloudPrivacyPrompt != null) {
+                item(key = "privacy_gate_card") {
+                    val (promptToSend, summary) = pendingCloudPrivacyPrompt!!
+                    PrivacyApprovalCard(
+                        summary = summary,
+                        onApprove = {
+                            pendingCloudPrivacyPrompt = null
+                            isSending = true
+                            scope.launch {
+                                runCloudQuery(promptToSend)
+                                isSending = false
+                            }
+                        },
+                        onDeny = {
+                            pendingCloudPrivacyPrompt = null
+                            scope.launch {
+                                dao.insertChat(
+                                    ChatMessageEntity(
+                                        role = "assistant",
+                                        text = "🛡️ Blocked cloud transmission to protect your private data."
+                                    )
+                                )
+                            }
+                        }
+                    )
+                }
             }
 
             if (pendingConfirmation != null) {
@@ -348,7 +439,12 @@ fun ChatPanel(
                 value = input,
                 onValueChange = { input = it },
                 modifier = Modifier.weight(1f),
-                placeholder = { Text("Ask or tap mic...", color = Color(0xFF64748B)) },
+                placeholder = {
+                    Text(
+                        if (isWakeActive) "Say \"Jarvis...\" or type..." else "Ask or tap mic...",
+                        color = Color(0xFF64748B)
+                    )
+                },
                 maxLines = 4,
                 shape = RoundedCornerShape(16.dp),
                 colors = OutlinedTextFieldDefaults.colors(
@@ -374,26 +470,17 @@ fun ChatPanel(
                             if (hasMic) {
                                 beginVoiceCapture()
                             } else {
-                                val activity = context as? Activity
-                                if (activity != null) {
+                                (context as? Activity)?.let { act ->
                                     securityManager.suppressNextAutoLock()
                                     ActivityCompat.requestPermissions(
-                                        activity,
+                                        act,
                                         arrayOf(Manifest.permission.RECORD_AUDIO),
                                         1001
                                     )
                                 }
                             }
                         }
-                    } catch (e: Throwable) {
-                        scope.launch {
-                            dao.insertChat(
-                                ChatMessageEntity(
-                                    role = "assistant",
-                                    text = "⚠️ Mic tap error: ${e.javaClass.simpleName} - ${e.message}"
-                                )
-                            )
-                        }
+                    } catch (_: Throwable) {
                     }
                 },
                 modifier = Modifier.size(50.dp),
@@ -441,6 +528,63 @@ private suspend fun handleOutcome(
         }
         is ToolExecutionOutcome.NeedsPermission -> {
             onNeedPermission(outcome.permissions, outcome.retryRequest)
+        }
+    }
+}
+
+@Composable
+private fun PrivacyApprovalCard(
+    summary: String,
+    onApprove: () -> Unit,
+    onDeny: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Color(0xFF1E1B2E), RoundedCornerShape(16.dp))
+            .border(1.dp, Color(0xFFA855F7), RoundedCornerShape(16.dp))
+            .padding(14.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Icon(Icons.Default.PrivacyTip, contentDescription = null, tint = Color(0xFFC084FC))
+            Text(
+                text = "Cloud Privacy Check",
+                color = Color(0xFFD8B4FE),
+                fontWeight = FontWeight.Bold,
+                fontSize = 14.sp
+            )
+        }
+
+        Text(
+            text = "This request may access contacts, messages, calendar, or files. Approve sending this query to your cloud model?\n\n$summary",
+            color = Color.White,
+            fontSize = 13.sp,
+            lineHeight = 18.sp
+        )
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            OutlinedButton(
+                onClick = onDeny,
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFF87171))
+            ) {
+                Text("Keep Local / Deny")
+            }
+
+            Button(
+                onClick = onApprove,
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7E22CE))
+            ) {
+                Text("Approve Cloud Send")
+            }
         }
     }
 }
@@ -510,7 +654,9 @@ private fun ConfirmationCard(
 private fun GreetingCard(
     greeting: String,
     ttsEnabled: Boolean,
+    wakeWordEnabled: Boolean,
     hasHistory: Boolean,
+    onToggleWakeWord: () -> Unit,
     onToggleTts: () -> Unit,
     onClearHistory: () -> Unit,
     onOpenSettings: () -> Unit
@@ -539,15 +685,27 @@ private fun GreetingCard(
                     modifier = Modifier.size(18.dp)
                 )
                 Text(
-                    text = "J.A.R.V.I.S. VOICE + CORE",
+                    text = if (wakeWordEnabled) "HYBRID CORE • \"JARVIS\" ON" else "J.A.R.V.I.S. HYBRID CORE",
                     color = Color(0xFF38BDF8),
-                    fontSize = 12.sp,
+                    fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,
-                    letterSpacing = 1.3.sp
+                    letterSpacing = 1.1.sp
                 )
             }
 
             Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(
+                    onClick = onToggleWakeWord,
+                    modifier = Modifier.size(28.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Hearing,
+                        contentDescription = "Toggle Wake-Word 'Jarvis'",
+                        tint = if (wakeWordEnabled) Color(0xFF34D399) else Color(0xFF64748B),
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+
                 IconButton(
                     onClick = onToggleTts,
                     modifier = Modifier.size(28.dp)

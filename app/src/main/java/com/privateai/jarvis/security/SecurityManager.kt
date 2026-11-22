@@ -98,7 +98,7 @@ class SecurityManager(context: Context) {
         prefs.edit().remove("last_crash_trace").apply()
     }
 
-    // --- Cloud AI & Voice Config ---
+    // --- Cloud AI, Local Model & Voice Config ---
 
     fun getUserName(): String = prefs.getString("user_name", "Boss") ?: "Boss"
 
@@ -127,10 +127,22 @@ class SecurityManager(context: Context) {
         prefs.edit().putString("api_key", key.trim()).apply()
     }
 
+    fun getLocalModelPath(): String = prefs.getString("local_model_path", "") ?: ""
+
+    fun setLocalModelPath(path: String) {
+        prefs.edit().putString("local_model_path", path.trim()).apply()
+    }
+
     fun isTtsEnabled(): Boolean = prefs.getBoolean("tts_enabled", true)
 
     fun setTtsEnabled(enabled: Boolean) {
         prefs.edit().putBoolean("tts_enabled", enabled).apply()
+    }
+
+    fun isWakeWordEnabled(): Boolean = prefs.getBoolean("wake_word_enabled", false)
+
+    fun setWakeWordEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean("wake_word_enabled", enabled).apply()
     }
 
     fun isCloudConfigured(): Boolean = getApiKey().isNotBlank() && getApiBaseUrl().isNotBlank()

@@ -41,6 +41,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.privateai.jarvis.ai.CloudChatClient
+import com.privateai.jarvis.ai.HybridRouter
+import com.privateai.jarvis.ai.LocalLlmEngine
 import com.privateai.jarvis.data.ActionLogEntity
 import com.privateai.jarvis.data.PinnedAppEntity
 import com.privateai.jarvis.data.VaultDatabase
@@ -62,11 +64,16 @@ fun LauncherScreen(
     val appRepo = remember { AppRepository(context) }
     val dao = remember { database.vaultDao() }
     val chatClient = remember { CloudChatClient(context, securityManager) }
+    val localEngine = remember { LocalLlmEngine(context, securityManager) }
+    val hybridRouter = remember { HybridRouter(chatClient, localEngine) }
     val toolExecutor = remember { ToolExecutor(context, appRepo, dao) }
     val voiceManager = remember { VoiceAssistantManager(context) }
 
     DisposableEffect(Unit) {
-        onDispose { voiceManager.release() }
+        onDispose {
+            voiceManager.release()
+            localEngine.close()
+        }
     }
 
     var selectedTab by remember { mutableIntStateOf(0) }
@@ -118,7 +125,11 @@ fun LauncherScreen(
                         letterSpacing = 2.5.sp
                     )
                     Text(
-                        text = if (securityManager.isCloudConfigured()) "Vault Encrypted • Voice & Tools Ready" else "Vault Encrypted • Setup Cloud Key",
+                        text = buildString {
+                            append("Vault Encrypted")
+                            if (localEngine.isModelFileAvailable()) append(" • Local AI")
+                            if (securityManager.isCloudConfigured()) append(" • Cloud AI")
+                        },
                         color = Color(0xFF64748B),
                         fontSize = 11.sp
                     )
@@ -202,6 +213,8 @@ fun LauncherScreen(
                     dao = dao,
                     securityManager = securityManager,
                     chatClient = chatClient,
+                    localEngine = localEngine,
+                    hybridRouter = hybridRouter,
                     toolExecutor = toolExecutor,
                     voiceManager = voiceManager,
                     installedAppNames = allApps.map { it.label },
@@ -283,6 +296,7 @@ fun LauncherScreen(
             SetupAndHyperOsSheet(
                 context = context,
                 securityManager = securityManager,
+                localEngine = localEngine,
                 onSaved = { showSetupSheet = false }
             )
         }
@@ -341,6 +355,7 @@ private fun AppTile(
 private fun SetupAndHyperOsSheet(
     context: Context,
     securityManager: SecurityManager,
+    localEngine: LocalLlmEngine,
     onSaved: () -> Unit
 ) {
     val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -350,6 +365,8 @@ private fun SetupAndHyperOsSheet(
     var baseUrl by remember { mutableStateOf(securityManager.getApiBaseUrl()) }
     var modelName by remember { mutableStateOf(securityManager.getApiModel()) }
     var apiKey by remember { mutableStateOf(securityManager.getApiKey()) }
+    var localPath by remember { mutableStateOf(securityManager.getLocalModelPath()) }
+    val detectedModels = remember { localEngine.findCandidateModels() }
 
     Column(
         modifier = Modifier
@@ -358,6 +375,39 @@ private fun SetupAndHyperOsSheet(
             .padding(20.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
+        Text(
+            text = "Local Offline Model (MediaPipe Int4)",
+            color = Color(0xFF34D399),
+            fontSize = 17.sp,
+            fontWeight = FontWeight.Bold
+        )
+        Text(
+            text = "Download Gemma-2-2B-it int4 (~1.35 GB) to /sdcard/Download/ and select it below:",
+            color = Color(0xFF94A3B8),
+            fontSize = 12.sp
+        )
+
+        if (detectedModels.isNotEmpty()) {
+            detectedModels.forEach { file ->
+                OutlinedButton(
+                    onClick = { localPath = file.absolutePath },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Use: ${file.name} (${file.length() / (1024 * 1024)} MB)")
+                }
+            }
+        }
+
+        OutlinedTextField(
+            value = localPath,
+            onValueChange = { localPath = it },
+            label = { Text("Local Model File Path (.bin / .task)") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
+
+        HorizontalDivider(color = Color(0xFF1E293B), modifier = Modifier.padding(vertical = 4.dp))
+
         Text(
             text = "Cloud Brain (Keystore Encrypted)",
             color = Color(0xFF38BDF8),
@@ -400,6 +450,7 @@ private fun SetupAndHyperOsSheet(
 
         Button(
             onClick = {
+                securityManager.setLocalModelPath(localPath)
                 securityManager.setUserName(userName)
                 securityManager.setApiBaseUrl(baseUrl)
                 securityManager.setApiModel(modelName)
@@ -409,7 +460,7 @@ private fun SetupAndHyperOsSheet(
             modifier = Modifier.fillMaxWidth(),
             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0284C7))
         ) {
-            Text("Save Cloud AI Settings")
+            Text("Save All AI Settings")
         }
 
         HorizontalDivider(color = Color(0xFF1E293B), modifier = Modifier.padding(vertical = 4.dp))
