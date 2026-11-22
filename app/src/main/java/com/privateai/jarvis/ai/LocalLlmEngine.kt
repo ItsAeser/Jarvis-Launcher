@@ -117,12 +117,21 @@ class LocalLlmEngine(
             try {
                 _modelStatus.value = "Loading ${file.name}..."
                 llmInference?.close()
-                val options = LlmInference.LlmInferenceOptions.builder()
-                    .setModelPath(path)
-                    .setMaxTokens(512)
-                    .build()
-
-                val instance = LlmInference.createFromOptions(context, options)
+                val instance = try {
+                    val cpuOptions = LlmInference.LlmInferenceOptions.builder()
+                        .setModelPath(path)
+                        .setMaxTokens(512)
+                        .setPreferredBackend(LlmInference.Backend.CPU)
+                        .build()
+                    LlmInference.createFromOptions(context, cpuOptions)
+                } catch (_: Throwable) {
+                    val gpuOptions = LlmInference.LlmInferenceOptions.builder()
+                        .setModelPath(path)
+                        .setMaxTokens(512)
+                        .setPreferredBackend(LlmInference.Backend.GPU)
+                        .build()
+                    LlmInference.createFromOptions(context, gpuOptions)
+                }
                 llmInference = instance
                 loadedPath = path
                 _modelStatus.value = "Loaded (${file.name})"

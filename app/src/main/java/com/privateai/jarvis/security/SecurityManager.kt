@@ -86,8 +86,6 @@ class SecurityManager(context: Context) {
         _isUnlocked.value = false
     }
 
-    // --- Crash Diagnostics ---
-
     fun saveLastCrashTrace(trace: String) {
         prefs.edit().putString("last_crash_trace", trace).commit()
     }
@@ -97,8 +95,6 @@ class SecurityManager(context: Context) {
     fun clearLastCrashTrace() {
         prefs.edit().remove("last_crash_trace").apply()
     }
-
-    // --- Cloud AI, Local Model & Voice Config ---
 
     fun getUserName(): String = prefs.getString("user_name", "Boss") ?: "Boss"
 
@@ -139,10 +135,17 @@ class SecurityManager(context: Context) {
         prefs.edit().putBoolean("tts_enabled", enabled).apply()
     }
 
-    fun isWakeWordEnabled(): Boolean = prefs.getBoolean("wake_word_enabled", false)
+    // Always-on wake word defaults to true in Step 6
+    fun isWakeWordEnabled(): Boolean = prefs.getBoolean("wake_word_enabled", true)
 
     fun setWakeWordEnabled(enabled: Boolean) {
         prefs.edit().putBoolean("wake_word_enabled", enabled).apply()
+    }
+
+    fun isMonochromeIconsEnabled(): Boolean = prefs.getBoolean("monochrome_icons", true)
+
+    fun setMonochromeIconsEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean("monochrome_icons", enabled).apply()
     }
 
     fun isCloudConfigured(): Boolean = getApiKey().isNotBlank() && getApiBaseUrl().isNotBlank()
