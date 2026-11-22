@@ -4,6 +4,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
@@ -14,7 +15,6 @@ import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
-import android.speech.tts.Voice
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -47,9 +47,11 @@ class VoiceAssistantManager(private val context: Context) {
     private val _voiceError = MutableStateFlow<String?>(null)
     val voiceError: StateFlow<String?> = _voiceError.asStateFlow()
 
+    @Volatile
+    var isBusyProcessing: Boolean = false
+
     private var wakeCallback: ((String?) -> Unit)? = null
-    private var savedNotifVolume: Int? = null
-    private var savedSystemVolume: Int? = null
+    private var focusRequest: AudioFocusRequest? = null
 
     init {
         try {
@@ -63,9 +65,6 @@ class VoiceAssistantManager(private val context: Context) {
         }
     }
 
-    /**
-     * Selects a refined British English (en-GB) male voice with calm, crisp J.A.R.V.I.S. pitch & cadence.
-     */
     private fun configureBritishButlerVoice() {
         val engine = tts ?: return
         val res = engine.setLanguage(Locale.UK)
@@ -78,7 +77,6 @@ class VoiceAssistantManager(private val context: Context) {
                     !it.isNetworkConnectionRequired
             }.orEmpty()
 
-            // Google TTS UK male voices typically contain "gba", "gbb", "gbd", or "male"
             val britishMale = ukVoices.firstOrNull { v ->
                 val n = v.name.lowercase(Locale.ROOT)
                 n.contains("gbb") || n.contains("gbd") || n.contains("male") || n.contains("daniel") || n.contains("arthur")
@@ -90,48 +88,43 @@ class VoiceAssistantManager(private val context: Context) {
         } catch (_: Throwable) {
         }
 
-        // Slightly deeper pitch (0.91) and crisp, composed cadence (1.03)
         engine.setPitch(0.91f)
         engine.setSpeechRate(1.03f)
     }
 
     /**
-     * Temporarily suppresses Android's SpeechRecognizer start/stop ding sound on Notification & System streams.
+     * Uses transient exclusive audio focus (never touches system ringer/notification volumes,
+     * so HyperOS Silent Mode is never toggled).
      */
-    private fun muteRecognizerDing() {
+    private fun acquireQuietFocus() {
         try {
-            if (savedNotifVolume == null) {
-                savedNotifVolume = audioManager.getStreamVolume(AudioManager.STREAM_NOTIFICATION)
-                audioManager.setStreamVolume(AudioManager.STREAM_NOTIFICATION, 0, 0)
-            }
-            if (savedSystemVolume == null) {
-                savedSystemVolume = audioManager.getStreamVolume(AudioManager.STREAM_SYSTEM)
-                audioManager.setStreamVolume(AudioManager.STREAM_SYSTEM, 0, 0)
+            if (focusRequest == null) {
+                val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build()
+                    )
+                    .build()
+                focusRequest = req
+                audioManager.requestAudioFocus(req)
             }
         } catch (_: Throwable) {
         }
     }
 
-    private fun restoreRecognizerDing() {
-        mainHandler.postDelayed({
-            try {
-                savedNotifVolume?.let { vol ->
-                    audioManager.setStreamVolume(AudioManager.STREAM_NOTIFICATION, vol, 0)
-                }
-                savedSystemVolume?.let { vol ->
-                    audioManager.setStreamVolume(AudioManager.STREAM_SYSTEM, vol, 0)
-                }
-            } catch (_: Throwable) {
-            } finally {
-                savedNotifVolume = null
-                savedSystemVolume = null
+    private fun releaseQuietFocus() {
+        try {
+            focusRequest?.let { req ->
+                audioManager.abandonAudioFocusRequest(req)
             }
-        }, 180L)
+        } catch (_: Throwable) {
+        } finally {
+            focusRequest = null
+        }
     }
 
-    /**
-     * Plays a sleek, subtle J.A.R.V.I.S. harmonic acknowledgement chime instead of Google's harsh ding.
-     */
     fun playJarvisAckChime() {
         Thread {
             try {
@@ -174,28 +167,34 @@ class VoiceAssistantManager(private val context: Context) {
     fun startWakeWordDetection(onWakeTriggered: (String?) -> Unit) {
         wakeCallback = onWakeTriggered
         _isWakeWordActive.value = true
-        scheduleWakeCycle(300L)
+        scheduleWakeCycle(600L)
     }
 
     fun stopWakeWordDetection() {
         _isWakeWordActive.value = false
         wakeCallback = null
         mainHandler.removeCallbacksAndMessages(null)
+        destroyWakeRecognizer()
+        releaseQuietFocus()
+    }
+
+    private fun destroyWakeRecognizer() {
         try {
             wakeRecognizer?.stopListening()
+        } catch (_: Throwable) {
+        }
+        try {
             wakeRecognizer?.destroy()
         } catch (_: Throwable) {
         }
         wakeRecognizer = null
-        restoreRecognizerDing()
     }
 
     private fun scheduleWakeCycle(delayMs: Long) {
         if (!_isWakeWordActive.value || _isListening.value) return
         mainHandler.postDelayed({
             if (!_isWakeWordActive.value || _isListening.value) return@postDelayed
-            // Pause silent wake polling while user is actively playing media
-            if (audioManager.isMusicActive || _isSpeaking.value) {
+            if (isBusyProcessing || audioManager.isMusicActive || _isSpeaking.value) {
                 scheduleWakeCycle(1500L)
                 return@postDelayed
             }
@@ -204,10 +203,7 @@ class VoiceAssistantManager(private val context: Context) {
     }
 
     private fun runSingleWakePass() {
-        try {
-            wakeRecognizer?.destroy()
-        } catch (_: Throwable) {
-        }
+        destroyWakeRecognizer()
         val recognizer = createSafeRecognizer()
         if (recognizer == null) {
             _isWakeWordActive.value = false
@@ -216,30 +212,28 @@ class VoiceAssistantManager(private val context: Context) {
         wakeRecognizer = recognizer
 
         try {
-            muteRecognizerDing()
+            acquireQuietFocus()
             recognizer.setRecognitionListener(object : RecognitionListener {
-                override fun onReadyForSpeech(params: Bundle?) {
-                    restoreRecognizerDing()
-                }
+                override fun onReadyForSpeech(params: Bundle?) {}
                 override fun onBeginningOfSpeech() {}
                 override fun onRmsChanged(rmsdB: Float) {}
                 override fun onBufferReceived(buffer: ByteArray?) {}
-                override fun onEndOfSpeech() {
-                    muteRecognizerDing()
-                }
+                override fun onEndOfSpeech() {}
 
                 override fun onError(error: Int) {
-                    restoreRecognizerDing()
-                    scheduleWakeCycle(550L)
+                    releaseQuietFocus()
+                    destroyWakeRecognizer()
+                    scheduleWakeCycle(1400L)
                 }
 
                 override fun onResults(results: Bundle?) {
-                    restoreRecognizerDing()
+                    releaseQuietFocus()
                     val heard = results
                         ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         ?.firstOrNull()
                         ?.trim()
                         .orEmpty()
+                    destroyWakeRecognizer()
                     handleWakeTranscript(heard)
                 }
 
@@ -252,11 +246,8 @@ class VoiceAssistantManager(private val context: Context) {
                     if (partial.equals("jarvis", ignoreCase = true) ||
                         partial.equals("hey jarvis", ignoreCase = true)
                     ) {
-                        try {
-                            muteRecognizerDing()
-                            recognizer.stopListening()
-                        } catch (_: Throwable) {
-                        }
+                        releaseQuietFocus()
+                        destroyWakeRecognizer()
                         handleWakeTranscript(partial)
                     }
                 }
@@ -266,8 +257,9 @@ class VoiceAssistantManager(private val context: Context) {
 
             recognizer.startListening(buildRecognizerIntent(silentPrompt = true))
         } catch (_: Throwable) {
-            restoreRecognizerDing()
-            scheduleWakeCycle(1200L)
+            releaseQuietFocus()
+            destroyWakeRecognizer()
+            scheduleWakeCycle(1600L)
         }
     }
 
@@ -282,15 +274,15 @@ class VoiceAssistantManager(private val context: Context) {
                 .trim()
             if (trailingCommand.isNotEmpty()) {
                 wakeCallback?.invoke(trailingCommand)
-                scheduleWakeCycle(1600L)
+                scheduleWakeCycle(2000L)
             } else {
                 speak("At your service.")
                 mainHandler.postDelayed({
                     wakeCallback?.invoke(null)
-                }, 750L)
+                }, 800L)
             }
         } else {
-            scheduleWakeCycle(350L)
+            scheduleWakeCycle(1100L)
         }
     }
 
@@ -301,10 +293,7 @@ class VoiceAssistantManager(private val context: Context) {
         _voiceError.value = null
         stopSpeaking()
         stopListening()
-        try {
-            wakeRecognizer?.stopListening()
-        } catch (_: Throwable) {
-        }
+        destroyWakeRecognizer()
 
         val recognizer = createSafeRecognizer()
         if (recognizer == null) {
@@ -315,10 +304,9 @@ class VoiceAssistantManager(private val context: Context) {
         speechRecognizer = recognizer
 
         try {
-            muteRecognizerDing()
+            acquireQuietFocus()
             recognizer.setRecognitionListener(object : RecognitionListener {
                 override fun onReadyForSpeech(params: Bundle?) {
-                    restoreRecognizerDing()
                     _isListening.value = true
                     _partialText.value = ""
                 }
@@ -328,12 +316,11 @@ class VoiceAssistantManager(private val context: Context) {
                 override fun onBufferReceived(buffer: ByteArray?) {}
 
                 override fun onEndOfSpeech() {
-                    muteRecognizerDing()
                     _isListening.value = false
                 }
 
                 override fun onError(error: Int) {
-                    restoreRecognizerDing()
+                    releaseQuietFocus()
                     _isListening.value = false
                     _partialText.value = ""
                     when (error) {
@@ -341,7 +328,7 @@ class VoiceAssistantManager(private val context: Context) {
                         SpeechRecognizer.ERROR_SPEECH_TIMEOUT,
                         SpeechRecognizer.ERROR_NO_MATCH -> {
                             _voiceError.value = "Didn't catch that. Tap mic or say \"Jarvis\"."
-                            if (_isWakeWordActive.value) scheduleWakeCycle(700L)
+                            if (_isWakeWordActive.value) scheduleWakeCycle(1200L)
                         }
                         else -> {
                             stopListening()
@@ -351,7 +338,7 @@ class VoiceAssistantManager(private val context: Context) {
                 }
 
                 override fun onResults(results: Bundle?) {
-                    restoreRecognizerDing()
+                    releaseQuietFocus()
                     _isListening.value = false
                     val text = results
                         ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
@@ -362,7 +349,7 @@ class VoiceAssistantManager(private val context: Context) {
                     if (text.isNotEmpty()) {
                         onFinalResult(text)
                     }
-                    if (_isWakeWordActive.value) scheduleWakeCycle(1200L)
+                    if (_isWakeWordActive.value) scheduleWakeCycle(1600L)
                 }
 
                 override fun onPartialResults(partialResults: Bundle?) {
@@ -380,7 +367,7 @@ class VoiceAssistantManager(private val context: Context) {
 
             recognizer.startListening(buildRecognizerIntent(silentPrompt = false))
         } catch (_: Throwable) {
-            restoreRecognizerDing()
+            releaseQuietFocus()
             stopListening()
             onFallbackToSystemDialog()
         }
@@ -390,6 +377,7 @@ class VoiceAssistantManager(private val context: Context) {
         return Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-IN")
+            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
             if (!silentPrompt) {
@@ -432,7 +420,7 @@ class VoiceAssistantManager(private val context: Context) {
         }
         speechRecognizer = null
         _isListening.value = false
-        restoreRecognizerDing()
+        releaseQuietFocus()
     }
 
     fun speak(text: String) {
@@ -445,7 +433,6 @@ class VoiceAssistantManager(private val context: Context) {
         try {
             _isSpeaking.value = true
             tts?.speak(clean, TextToSpeech.QUEUE_FLUSH, null, "jarvis_utterance")
-            // Estimate utterance finish so wake-word resumes automatically
             val estMs = (clean.length * 55L).coerceIn(1200L, 12000L)
             mainHandler.postDelayed({ _isSpeaking.value = false }, estMs)
         } catch (_: Throwable) {

@@ -98,6 +98,7 @@ import com.privateai.jarvis.tools.ToolExecutor
 import com.privateai.jarvis.voice.VoiceAssistantManager
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -200,64 +201,78 @@ fun LauncherScreen(
         )
     }
 
+    LaunchedEffect(isSending, input) {
+        voiceManager.isBusyProcessing = isSending || input.isNotBlank()
+    }
+
     val submitPrompt: (String) -> Unit = { rawText ->
         val prompt = rawText.trim()
         if (prompt.isNotEmpty() && !isSending) {
             input = ""
             isJarvisExpanded = true
             isSending = true
+            voiceManager.isBusyProcessing = true
             scope.launch {
-                dao.insertChat(ChatMessageEntity(role = "user", text = prompt))
-                val appLabels = allApps.map { it.label }
+                try {
+                    dao.insertChat(ChatMessageEntity(role = "user", text = prompt))
+                    val appLabels = allApps.map { it.label }
 
-                when (val route = hybridRouter.decideRoute(prompt)) {
-                    is RouteDecision.DirectTool -> {
-                        val outcome = toolExecutor.handleToolRequest(route.request, confirmed = false)
-                        handleOutcome(
-                            outcome = outcome,
-                            dao = dao,
-                            speakReply = { if (ttsEnabled) voiceManager.speak(it) },
-                            onNeedConfirm = { pendingConfirmation = it },
-                            onNeedPermission = { _, req -> pendingPermissionTool = req }
-                        )
-                    }
-                    is RouteDecision.Cloud -> {
-                        if (route.requiresPrivacyApproval) {
-                            pendingCloudPrivacyPrompt = Pair(prompt, route.privacySummary)
-                            if (ttsEnabled) {
-                                voiceManager.speak("Approval required before sending personal data online.")
+                    when (val route = hybridRouter.decideRoute(prompt)) {
+                        is RouteDecision.DirectTool -> {
+                            val outcome = toolExecutor.handleToolRequest(route.request, confirmed = false)
+                            handleOutcome(
+                                outcome = outcome,
+                                dao = dao,
+                                speakReply = { if (ttsEnabled) voiceManager.speak(it) },
+                                onNeedConfirm = { pendingConfirmation = it },
+                                onNeedPermission = { _, req -> pendingPermissionTool = req }
+                            )
+                        }
+                        is RouteDecision.Cloud -> {
+                            if (route.requiresPrivacyApproval) {
+                                pendingCloudPrivacyPrompt = Pair(prompt, route.privacySummary)
+                                if (ttsEnabled) {
+                                    voiceManager.speak("Approval required before sending personal data online.")
+                                }
+                            } else {
+                                runCloudQuery(prompt)
                             }
-                        } else {
-                            runCloudQuery(prompt)
+                        }
+                        is RouteDecision.LocalFirst -> {
+                            val hybridRes = withTimeoutOrNull(35_000L) {
+                                hybridRouter.executeHybrid(prompt, messages, appLabels)
+                            } ?: Result.failure(IllegalStateException("Inference timed out after 35s. Check your local model or API settings."))
+                            hybridRes.fold(
+                                onSuccess = { (turn, _) ->
+                                    if (turn.toolRequest != null) {
+                                        val outcome = toolExecutor.handleToolRequest(turn.toolRequest, confirmed = false)
+                                        handleOutcome(
+                                            outcome = outcome,
+                                            dao = dao,
+                                            speakReply = { if (ttsEnabled) voiceManager.speak(it) },
+                                            onNeedConfirm = { pendingConfirmation = it },
+                                            onNeedPermission = { _, req -> pendingPermissionTool = req }
+                                        )
+                                    } else {
+                                        dao.insertChat(ChatMessageEntity(role = "assistant", text = turn.replyText))
+                                        if (ttsEnabled) voiceManager.speak(turn.replyText)
+                                    }
+                                },
+                                onFailure = { err ->
+                                    val msg = "⚠️ ${err.message ?: "Local/Hybrid inference failed."}"
+                                    dao.insertChat(ChatMessageEntity(role = "assistant", text = msg))
+                                    if (ttsEnabled) voiceManager.speak(msg)
+                                }
+                            )
                         }
                     }
-                    is RouteDecision.LocalFirst -> {
-                        val hybridRes = hybridRouter.executeHybrid(prompt, messages, appLabels)
-                        hybridRes.fold(
-                            onSuccess = { (turn, _) ->
-                                if (turn.toolRequest != null) {
-                                    val outcome = toolExecutor.handleToolRequest(turn.toolRequest, confirmed = false)
-                                    handleOutcome(
-                                        outcome = outcome,
-                                        dao = dao,
-                                        speakReply = { if (ttsEnabled) voiceManager.speak(it) },
-                                        onNeedConfirm = { pendingConfirmation = it },
-                                        onNeedPermission = { _, req -> pendingPermissionTool = req }
-                                    )
-                                } else {
-                                    dao.insertChat(ChatMessageEntity(role = "assistant", text = turn.replyText))
-                                    if (ttsEnabled) voiceManager.speak(turn.replyText)
-                                }
-                            },
-                            onFailure = { err ->
-                                val msg = "⚠️ ${err.message ?: "Local/Hybrid inference failed."}"
-                                dao.insertChat(ChatMessageEntity(role = "assistant", text = msg))
-                                if (ttsEnabled) voiceManager.speak(msg)
-                            }
-                        )
-                    }
+                } catch (e: Throwable) {
+                    val msg = "⚠️ Error: ${e.message ?: "Unexpected failure"}"
+                    dao.insertChat(ChatMessageEntity(role = "assistant", text = msg))
+                } finally {
+                    isSending = false
+                    voiceManager.isBusyProcessing = false
                 }
-                isSending = false
             }
         }
     }
@@ -560,6 +575,29 @@ fun LauncherScreen(
                                         .padding(horizontal = 12.dp, vertical = 8.dp)
                                 ) {
                                     Text(text = msg.text, color = Color.White, fontSize = 13.sp)
+                                }
+                            }
+                        }
+
+                        if (isSending) {
+                            item {
+                                Row(
+                                    modifier = Modifier
+                                        .background(Color(0xFF1E293B), RoundedCornerShape(14.dp))
+                                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(14.dp),
+                                        strokeWidth = 2.dp,
+                                        color = Color(0xFF38BDF8)
+                                    )
+                                    Text(
+                                        text = "J.A.R.V.I.S. is processing...",
+                                        color = Color(0xFF38BDF8),
+                                        fontSize = 12.sp
+                                    )
                                 }
                             }
                         }

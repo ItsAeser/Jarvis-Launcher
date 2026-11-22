@@ -13,8 +13,8 @@ android {
         applicationId = "com.privateai.jarvis"
         minSdk = 29
         targetSdk = 35
-        versionCode = 13
-        versionName = "1.0-step6.1"
+        versionCode = 14
+        versionName = "1.0-step6.2"
     }
 
     buildTypes {
