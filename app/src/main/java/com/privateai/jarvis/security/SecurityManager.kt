@@ -142,7 +142,7 @@ class SecurityManager(context: Context) {
         prefs.edit().putBoolean("wake_word_enabled", enabled).apply()
     }
 
-    fun isMonochromeIconsEnabled(): Boolean = prefs.getBoolean("monochrome_icons", true)
+    fun isMonochromeIconsEnabled(): Boolean = prefs.getBoolean("monochrome_icons", false)
 
     fun setMonochromeIconsEnabled(enabled: Boolean) {
         prefs.edit().putBoolean("monochrome_icons", enabled).apply()

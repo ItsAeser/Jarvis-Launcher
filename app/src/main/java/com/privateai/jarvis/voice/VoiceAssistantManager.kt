@@ -47,6 +47,9 @@ class VoiceAssistantManager(private val context: Context) {
     private val _voiceError = MutableStateFlow<String?>(null)
     val voiceError: StateFlow<String?> = _voiceError.asStateFlow()
 
+    private val _voiceAmplitude = MutableStateFlow(0f)
+    val voiceAmplitude: StateFlow<Float> = _voiceAmplitude.asStateFlow()
+
     @Volatile
     var isBusyProcessing: Boolean = false
 
@@ -97,21 +100,7 @@ class VoiceAssistantManager(private val context: Context) {
      * so HyperOS Silent Mode is never toggled).
      */
     private fun acquireQuietFocus() {
-        try {
-            if (focusRequest == null) {
-                val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
-                    .setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                            .build()
-                    )
-                    .build()
-                focusRequest = req
-                audioManager.requestAudioFocus(req)
-            }
-        } catch (_: Throwable) {
-        }
+        // No-op: HyperOS 3 triggers Silent/DND mode whenever AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE is requested.
     }
 
     private fun releaseQuietFocus() {
@@ -216,7 +205,11 @@ class VoiceAssistantManager(private val context: Context) {
             recognizer.setRecognitionListener(object : RecognitionListener {
                 override fun onReadyForSpeech(params: Bundle?) {}
                 override fun onBeginningOfSpeech() {}
-                override fun onRmsChanged(rmsdB: Float) {}
+                override fun onRmsChanged(rmsdB: Float) {
+                    // Map typical speech RMS (-2 dB to 10 dB) into 0f..1f for the reactive orb
+                    val normalized = ((rmsdB + 2f) / 12f).coerceIn(0f, 1f)
+                    _voiceAmplitude.value = normalized
+                }
                 override fun onBufferReceived(buffer: ByteArray?) {}
                 override fun onEndOfSpeech() {}
 
@@ -312,7 +305,11 @@ class VoiceAssistantManager(private val context: Context) {
                 }
 
                 override fun onBeginningOfSpeech() {}
-                override fun onRmsChanged(rmsdB: Float) {}
+                override fun onRmsChanged(rmsdB: Float) {
+                    // Map typical speech RMS (-2 dB to 10 dB) into 0f..1f for the reactive orb
+                    val normalized = ((rmsdB + 2f) / 12f).coerceIn(0f, 1f)
+                    _voiceAmplitude.value = normalized
+                }
                 override fun onBufferReceived(buffer: ByteArray?) {}
 
                 override fun onEndOfSpeech() {
@@ -322,6 +319,7 @@ class VoiceAssistantManager(private val context: Context) {
                 override fun onError(error: Int) {
                     releaseQuietFocus()
                     _isListening.value = false
+                    _voiceAmplitude.value = 0f
                     _partialText.value = ""
                     when (error) {
                         SpeechRecognizer.ERROR_CLIENT,
@@ -420,6 +418,7 @@ class VoiceAssistantManager(private val context: Context) {
         }
         speechRecognizer = null
         _isListening.value = false
+        _voiceAmplitude.value = 0f
         releaseQuietFocus()
     }
 

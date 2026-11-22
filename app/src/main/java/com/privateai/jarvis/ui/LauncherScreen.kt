@@ -19,7 +19,15 @@ import android.view.KeyEvent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -66,8 +74,14 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.ColorFilter
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.ColorMatrix
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
@@ -174,6 +188,8 @@ fun LauncherScreen(
     val isWakeActive by voiceManager.isWakeWordActive.collectAsState()
     val partialVoice by voiceManager.partialText.collectAsState()
     val voiceError by voiceManager.voiceError.collectAsState()
+    val isSpeaking by voiceManager.isSpeaking.collectAsState()
+    val voiceAmplitude by voiceManager.voiceAmplitude.collectAsState()
 
     val runCloudQuery: suspend (String) -> Unit = { prompt ->
         val result = chatClient.sendMessage(messages, prompt, allApps.map { it.label })
@@ -456,22 +472,59 @@ fun LauncherScreen(
             }
 
             if (!isJarvisExpanded) {
-                Spacer(modifier = Modifier.height(6.dp))
-                // Big Space Clock + Date matching your home screen
+                Spacer(modifier = Modifier.height(4.dp))
                 Text(
                     text = currentTimeStr,
                     color = Color(0xFF7DD3FC),
-                    fontSize = 58.sp,
+                    fontSize = 52.sp,
                     fontWeight = FontWeight.ExtraBold,
                     letterSpacing = 2.sp
                 )
                 Text(
                     text = currentDateStr,
                     color = Color.White,
-                    fontSize = 15.sp,
+                    fontSize = 14.sp,
                     fontWeight = FontWeight.Medium
                 )
-                Spacer(modifier = Modifier.height(14.dp))
+                Spacer(modifier = Modifier.height(8.dp))
+                // Siri-style voice-reactive J.A.R.V.I.S. sphere
+                JarvisReactiveOrb(
+                    isListening = isListening,
+                    isSpeaking = isSpeaking,
+                    isProcessing = isSending,
+                    amplitude = voiceAmplitude,
+                    onClick = {
+                        if (isListening) {
+                            voiceManager.stopListening()
+                        } else {
+                            val hasMic = ContextCompat.checkSelfPermission(
+                                context,
+                                Manifest.permission.RECORD_AUDIO
+                            ) == PackageManager.PERMISSION_GRANTED
+                            if (hasMic) {
+                                beginVoiceCapture()
+                            } else {
+                                (context as? Activity)?.let { act ->
+                                    securityManager.suppressNextAutoLock()
+                                    ActivityCompat.requestPermissions(act, arrayOf(Manifest.permission.RECORD_AUDIO), 1001)
+                                }
+                            }
+                        }
+                    }
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+            } else {
+                JarvisReactiveOrb(
+                    isListening = isListening,
+                    isSpeaking = isSpeaking,
+                    isProcessing = isSending,
+                    amplitude = voiceAmplitude,
+                    sizeDp = 62f,
+                    onClick = {
+                        if (isListening) voiceManager.stopListening() else beginVoiceCapture()
+                    }
+                )
+                Spacer(modifier = Modifier.height(6.dp))
             }
 
             // Glassmorphic J.A.R.V.I.S. Command & Chat Card
@@ -1267,4 +1320,139 @@ private fun drawableToBitmap(drawable: Drawable): Bitmap {
     drawable.setBounds(0, 0, canvas.width, canvas.height)
     drawable.draw(canvas)
     return bitmap
+}
+
+
+@Composable
+private fun JarvisReactiveOrb(
+    isListening: Boolean,
+    isSpeaking: Boolean,
+    isProcessing: Boolean,
+    amplitude: Float,
+    sizeDp: Float = 84f,
+    onClick: () -> Unit
+) {
+    val infiniteTransition = rememberInfiniteTransition(label = "jarvis_orb")
+    val idleBreath by infiniteTransition.animateFloat(
+        initialValue = 0.88f,
+        targetValue = 1.04f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1800, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "idle_breath"
+    )
+    val spinPhase by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 6.283185f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 2600, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "spin_phase"
+    )
+    val speakWave by infiniteTransition.animateFloat(
+        initialValue = 0.15f,
+        targetValue = 0.85f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 360, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "speak_wave"
+    )
+
+    val effectiveEnergy = when {
+        isListening -> (0.25f + amplitude * 0.95f).coerceIn(0.25f, 1.25f)
+        isSpeaking -> 0.35f + speakWave * 0.65f
+        isProcessing -> 0.55f
+        else -> 0f
+    }
+
+    val smoothEnergy by animateFloatAsState(
+        targetValue = effectiveEnergy,
+        animationSpec = tween(durationMillis = 90),
+        label = "smooth_energy"
+    )
+
+    Box(
+        modifier = Modifier
+            .size(sizeDp.dp)
+            .clip(CircleShape)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            val center = Offset(size.width / 2f, size.height / 2f)
+            val baseRadius = size.minDimension * 0.34f
+            val scale = if (smoothEnergy > 0.05f) 0.95f + smoothEnergy * 0.32f else idleBreath
+
+            // Outer ambient plasma halo
+            drawCircle(
+                brush = Brush.radialGradient(
+                    colors = listOf(
+                        Color(0x6638BDF8),
+                        Color(0x33818CF8),
+                        Color.Transparent
+                    ),
+                    center = center,
+                    radius = baseRadius * (1.45f * scale)
+                ),
+                radius = baseRadius * (1.45f * scale),
+                center = center
+            )
+
+            // Secondary Siri-like iridescent wave lobe 1
+            val offset1 = Offset(
+                center.x + kotlin.math.cos(spinPhase) * baseRadius * 0.16f * (1f + smoothEnergy),
+                center.y + kotlin.math.sin(spinPhase) * baseRadius * 0.16f * (1f + smoothEnergy)
+            )
+            drawCircle(
+                brush = Brush.radialGradient(
+                    colors = listOf(
+                        Color(0xAA22D3EE),
+                        Color(0x553B82F6),
+                        Color.Transparent
+                    ),
+                    center = offset1,
+                    radius = baseRadius * (1.08f * scale)
+                ),
+                radius = baseRadius * (1.08f * scale),
+                center = offset1
+            )
+
+            // Secondary Siri-like iridescent wave lobe 2
+            val offset2 = Offset(
+                center.x - kotlin.math.cos(spinPhase * 1.3f) * baseRadius * 0.16f * (1f + smoothEnergy),
+                center.y - kotlin.math.sin(spinPhase * 1.3f) * baseRadius * 0.16f * (1f + smoothEnergy)
+            )
+            drawCircle(
+                brush = Brush.radialGradient(
+                    colors = listOf(
+                        if (isListening) Color(0xAA34D399) else Color(0xAAA855F7),
+                        Color(0x446366F1),
+                        Color.Transparent
+                    ),
+                    center = offset2,
+                    radius = baseRadius * (1.02f * scale)
+                ),
+                radius = baseRadius * (1.02f * scale),
+                center = offset2
+            )
+
+            // Luminous core sphere
+            drawCircle(
+                brush = Brush.radialGradient(
+                    colors = listOf(
+                        Color.White,
+                        Color(0xFF7DD3FC),
+                        Color(0xFF0284C7)
+                    ),
+                    center = center,
+                    radius = baseRadius * (0.78f * scale)
+                ),
+                radius = baseRadius * (0.78f * scale),
+                center = center
+            )
+        }
+    }
 }
