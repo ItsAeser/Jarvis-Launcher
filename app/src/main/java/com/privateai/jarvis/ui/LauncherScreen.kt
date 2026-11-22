@@ -7,8 +7,11 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.Drawable
 import android.net.Uri
+import android.os.Environment
 import android.os.PowerManager
 import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.combinedClickable
@@ -358,15 +361,38 @@ private fun SetupAndHyperOsSheet(
     localEngine: LocalLlmEngine,
     onSaved: () -> Unit
 ) {
+    val scope = rememberCoroutineScope()
     val pm = context.getSystemService(Context.POWER_SERVICE) as PowerManager
     val isBatteryExempt = pm.isIgnoringBatteryOptimizations(context.packageName)
+    val hasAllFiles = Environment.isExternalStorageManager()
 
     var userName by remember { mutableStateOf(securityManager.getUserName()) }
     var baseUrl by remember { mutableStateOf(securityManager.getApiBaseUrl()) }
     var modelName by remember { mutableStateOf(securityManager.getApiModel()) }
     var apiKey by remember { mutableStateOf(securityManager.getApiKey()) }
     var localPath by remember { mutableStateOf(securityManager.getLocalModelPath()) }
+    var importStatus by remember { mutableStateOf<String?>(null) }
     val detectedModels = remember { localEngine.findCandidateModels() }
+
+    val modelPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            importStatus = "Copying model to private vault (may take ~10s)..."
+            scope.launch {
+                val res = localEngine.importModelFromUri(uri)
+                res.fold(
+                    onSuccess = { copiedPath ->
+                        localPath = copiedPath
+                        importStatus = "Imported successfully!"
+                    },
+                    onFailure = { err ->
+                        importStatus = "Import failed: ${err.message}"
+                    }
+                )
+            }
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -376,16 +402,26 @@ private fun SetupAndHyperOsSheet(
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         Text(
-            text = "Local Offline Model (MediaPipe Int4)",
+            text = "Local Offline Model (MediaPipe .task / .bin)",
             color = Color(0xFF34D399),
             fontSize = 17.sp,
             fontWeight = FontWeight.Bold
         )
-        Text(
-            text = "Download Gemma-2-2B-it int4 (~1.35 GB) to /sdcard/Download/ and select it below:",
-            color = Color(0xFF94A3B8),
-            fontSize = 12.sp
-        )
+
+        Button(
+            onClick = {
+                securityManager.suppressNextAutoLock()
+                modelPickerLauncher.launch(arrayOf("*/*"))
+            },
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
+        ) {
+            Text("Pick & Import .task / .bin Model File")
+        }
+
+        if (importStatus != null) {
+            Text(text = importStatus!!, color = Color(0xFF38BDF8), fontSize = 12.sp)
+        }
 
         if (detectedModels.isNotEmpty()) {
             detectedModels.forEach { file ->
@@ -401,7 +437,7 @@ private fun SetupAndHyperOsSheet(
         OutlinedTextField(
             value = localPath,
             onValueChange = { localPath = it },
-            label = { Text("Local Model File Path (.bin / .task)") },
+            label = { Text("Local Model File Path") },
             singleLine = true,
             modifier = Modifier.fillMaxWidth()
         )
@@ -536,6 +572,22 @@ private fun SetupAndHyperOsSheet(
             modifier = Modifier.fillMaxWidth()
         ) {
             Text("4. HyperOS Background Pop-up & App Permissions")
+        }
+
+        OutlinedButton(
+            onClick = {
+                try {
+                    val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                        data = Uri.parse("package:${context.packageName}")
+                    }
+                    context.startActivity(intent)
+                } catch (_: Exception) {
+                    context.startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                }
+            },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(if (hasAllFiles) "5. All Files Access Granted (Done)" else "5. Grant All Files Access (For /sdcard Models)")
         }
 
         Spacer(modifier = Modifier.height(16.dp))

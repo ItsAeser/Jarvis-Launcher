@@ -1,6 +1,8 @@
 package com.privateai.jarvis.ai
 
 import android.content.Context
+import android.net.Uri
+import android.provider.OpenableColumns
 import com.google.mediapipe.tasks.genai.llminference.LlmInference
 import com.privateai.jarvis.security.SecurityManager
 import kotlinx.coroutines.Dispatchers
@@ -11,6 +13,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileOutputStream
 
 class LocalLlmEngine(
     private val context: Context,
@@ -25,30 +28,67 @@ class LocalLlmEngine(
 
     fun findCandidateModels(): List<File> {
         val dirs = listOf(
-            File("/sdcard/Download"),
+            context.filesDir,
+            context.getExternalFilesDir(null),
             File("/sdcard/jarvis launcher"),
-            context.getExternalFilesDir(null)
+            File("/sdcard/Download")
         ).filterNotNull()
 
         val found = mutableListOf<File>()
         for (dir in dirs) {
-            if (dir.exists() && dir.isDirectory) {
-                dir.listFiles()?.forEach { f ->
-                    val lower = f.name.lowercase()
-                    if (f.isFile && (lower.endsWith(".bin") || lower.endsWith(".task") || lower.endsWith(".tflite"))) {
-                        if (f.length() > 50_000_000L) { // > 50 MB
-                            found.add(f)
+            try {
+                if (dir.exists() && dir.isDirectory && dir.canRead()) {
+                    dir.listFiles()?.forEach { f ->
+                        val lower = f.name.lowercase()
+                        if (f.isFile && f.canRead() && (lower.endsWith(".bin") || lower.endsWith(".task") || lower.endsWith(".tflite"))) {
+                            if (f.length() > 50_000_000L) {
+                                found.add(f)
+                            }
                         }
                     }
                 }
+            } catch (_: Throwable) {
             }
         }
         return found.distinctBy { it.absolutePath }
     }
 
+    suspend fun importModelFromUri(uri: Uri): Result<String> = withContext(Dispatchers.IO) {
+        try {
+            var fileName = "local_model.task"
+            context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (nameIdx != -1 && cursor.moveToFirst()) {
+                    fileName = cursor.getString(nameIdx) ?: fileName
+                }
+            }
+
+            val destFile = File(context.filesDir, fileName)
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                FileOutputStream(destFile).use { output ->
+                    val buffer = ByteArray(1024 * 1024)
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read == -1) break
+                        output.write(buffer, 0, read)
+                    }
+                    output.flush()
+                }
+            } ?: return@withContext Result.failure(IllegalStateException("Unable to open selected file stream."))
+
+            securityManager.setLocalModelPath(destFile.absolutePath)
+            Result.success(destFile.absolutePath)
+        } catch (e: Throwable) {
+            Result.failure(e)
+        }
+    }
+
     fun isModelFileAvailable(): Boolean {
         val configured = securityManager.getLocalModelPath()
-        if (configured.isNotBlank() && File(configured).exists()) return true
+        if (configured.isNotBlank()) {
+            val f = File(configured)
+            if (f.exists() && f.canRead()) return true
+        }
         return findCandidateModels().isNotEmpty()
     }
 
@@ -57,10 +97,16 @@ class LocalLlmEngine(
             val path = securityManager.getLocalModelPath().ifBlank {
                 findCandidateModels().firstOrNull()?.absolutePath.orEmpty()
             }
-            if (path.isBlank() || !File(path).exists()) {
+            val file = File(path)
+            if (path.isBlank() || !file.exists()) {
                 _modelStatus.value = "No local model file found"
                 return@withLock Result.failure(
-                    IllegalStateException("No local model (.bin/.task) found in Downloads. Place Gemma-2-2B-it int4 in /sdcard/Download and select it in Settings.")
+                    IllegalStateException("No local model (.bin/.task) found. Tap the Gear icon -> 'Import Model File' or enable All Files Access.")
+                )
+            }
+            if (!file.canRead()) {
+                return@withLock Result.failure(
+                    IllegalStateException("Android 16 blocked reading $path. Open Settings (Gear icon) -> '5. Grant All Files Access' or use 'Import Model File'.")
                 )
             }
 
@@ -69,7 +115,7 @@ class LocalLlmEngine(
             }
 
             try {
-                _modelStatus.value = "Loading ${File(path).name}..."
+                _modelStatus.value = "Loading ${file.name}..."
                 llmInference?.close()
                 val options = LlmInference.LlmInferenceOptions.builder()
                     .setModelPath(path)
@@ -79,7 +125,7 @@ class LocalLlmEngine(
                 val instance = LlmInference.createFromOptions(context, options)
                 llmInference = instance
                 loadedPath = path
-                _modelStatus.value = "Loaded (${File(path).name})"
+                _modelStatus.value = "Loaded (${file.name})"
                 Result.success(instance)
             } catch (e: Throwable) {
                 _modelStatus.value = "Load error: ${e.message}"
