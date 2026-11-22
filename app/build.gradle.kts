@@ -13,8 +13,8 @@ android {
         applicationId = "com.privateai.jarvis"
         minSdk = 29
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0-step1"
+        versionCode = 2
+        versionName = "1.0-step2"
     }
 
     buildTypes {
@@ -67,4 +67,7 @@ dependencies {
     implementation("androidx.room:room-runtime:2.6.1")
     implementation("androidx.room:room-ktx:2.6.1")
     ksp("androidx.room:room-compiler:2.6.1")
+
+    // Lightweight HTTPS client for Cloud AI / Proxy
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 }

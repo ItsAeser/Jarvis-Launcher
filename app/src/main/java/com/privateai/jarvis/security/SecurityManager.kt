@@ -75,16 +75,42 @@ class SecurityManager(context: Context) {
         _isUnlocked.value = false
     }
 
+    // --- Cloud AI & Personalization Config (Encrypted in Keystore) ---
+
+    fun getUserName(): String = prefs.getString("user_name", "Boss") ?: "Boss"
+
+    fun setUserName(name: String) {
+        prefs.edit().putString("user_name", name.trim().ifEmpty { "Boss" }).apply()
+    }
+
+    fun getApiBaseUrl(): String =
+        prefs.getString("api_base_url", "https://openrouter.ai/api/v1") ?: "https://openrouter.ai/api/v1"
+
+    fun setApiBaseUrl(url: String) {
+        prefs.edit().putString("api_base_url", url.trim().removeSuffix("/")).apply()
+    }
+
+    fun getApiModel(): String =
+        prefs.getString("api_model", "google/gemini-2.5-flash") ?: "google/gemini-2.5-flash"
+
+    fun setApiModel(model: String) {
+        prefs.edit().putString("api_model", model.trim()).apply()
+    }
+
+    fun getApiKey(): String = prefs.getString("api_key", "") ?: ""
+
+    fun setApiKey(key: String) {
+        prefs.edit().putString("api_key", key.trim()).apply()
+    }
+
+    fun isCloudConfigured(): Boolean = getApiKey().isNotBlank() && getApiBaseUrl().isNotBlank()
+
     private fun hashPin(pin: String, salt: ByteArray): ByteArray {
         val digest = MessageDigest.getInstance("SHA-256")
         digest.update(salt)
         return digest.digest(pin.toByteArray(Charsets.UTF_8))
     }
 
-    /**
-     * Generates and wraps a 32-byte SQLCipher passphrase using a hardware-backed
-     * AES-256-GCM key inside Android Keystore.
-     */
     fun getOrCreateDatabasePassphrase(): ByteArray {
         val existingCipher = prefs.getString("db_key_cipher", null)
         val existingIv = prefs.getString("db_key_iv", null)

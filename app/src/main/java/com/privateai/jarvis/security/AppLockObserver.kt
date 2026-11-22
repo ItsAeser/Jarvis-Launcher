@@ -8,7 +8,6 @@ class AppLockObserver(
 ) : DefaultLifecycleObserver {
 
     override fun onStop(owner: LifecycleOwner) {
-        // Auto-lock immediately when user leaves the app or turns off the screen
         securityManager.lock()
     }
 }

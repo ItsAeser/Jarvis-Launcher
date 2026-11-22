@@ -17,7 +17,6 @@ class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Block screenshots and hide app content from Android Recents preview
         window.setFlags(
             WindowManager.LayoutParams.FLAG_SECURE,
             WindowManager.LayoutParams.FLAG_SECURE
@@ -27,7 +26,6 @@ class MainActivity : FragmentActivity() {
         val securityManager = app.securityManager
 
         setContent {
-            // Prevent Back button from exiting a Home Launcher
             BackHandler(enabled = true) { }
 
             val isUnlocked by securityManager.isUnlocked.collectAsState()

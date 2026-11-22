@@ -26,6 +26,9 @@ interface VaultDao {
     @Insert
     suspend fun insertChat(message: ChatMessageEntity)
 
+    @Query("DELETE FROM chat_messages")
+    suspend fun clearChat()
+
     @Query("SELECT * FROM action_logs ORDER BY timestamp DESC")
     fun observeLogs(): Flow<List<ActionLogEntity>>
 
