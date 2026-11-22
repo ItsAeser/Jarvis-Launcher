@@ -57,7 +57,6 @@ class ToolExecutor(
     ): ToolExecutionOutcome {
         val tool = request.tool.lowercase(Locale.ROOT).trim()
 
-        // Hard whitelist guardrail
         if (tool !in WHITELIST) {
             val msg = "Blocked: '$tool' is outside the permitted tool whitelist."
             dao.insertLog(ActionLogEntity(toolName = tool, summary = msg, status = "BLOCKED"))
@@ -95,7 +94,7 @@ class ToolExecutor(
                     status = "FAILED"
                 )
             )
-            return ToolExecutionOutcome.Completed("I couldn't find an installed app matching "$query".")
+            return ToolExecutionOutcome.Completed("I couldn't find an installed app matching \"$query\".")
         }
 
         val launched = appRepository.launchApp(partial.packageName)
@@ -175,7 +174,7 @@ class ToolExecutor(
                 status = "EXECUTED"
             )
         )
-        return ToolExecutionOutcome.Completed("📝 Saved encrypted note "$title" to your vault.")
+        return ToolExecutionOutcome.Completed("📝 Saved encrypted note \"$title\" to your vault.")
     }
 
     private suspend fun executeCalendar(
@@ -205,8 +204,7 @@ class ToolExecutor(
                     PendingToolAction(
                         toolName = "calendar",
                         title = "Confirm Calendar Event",
-                        details = "Event: $title
-When: ${dateTimeStr.ifEmpty { "Next hour" }}",
+                        details = "Event: $title\nWhen: ${dateTimeStr.ifEmpty { "Next hour" }}",
                         request = request
                     )
                 )
@@ -232,12 +230,11 @@ When: ${dateTimeStr.ifEmpty { "Next hour" }}",
                         status = "EXECUTED"
                     )
                 )
-                ToolExecutionOutcome.Completed("📅 Added "$title" to your calendar.")
+                ToolExecutionOutcome.Completed("📅 Added \"$title\" to your calendar.")
             } else {
                 ToolExecutionOutcome.Completed("Failed to insert calendar event.")
             }
         } else {
-            // Read upcoming events in next 7 days
             val now = System.currentTimeMillis()
             val weekLater = now + 7L * 24 * 60 * 60 * 1000
             val projection = arrayOf(
@@ -273,9 +270,7 @@ When: ${dateTimeStr.ifEmpty { "Next hour" }}",
             val reply = if (events.isEmpty()) {
                 "📅 You have no calendar events scheduled for the next 7 days."
             } else {
-                "📅 Upcoming events:
-" + events.joinToString("
-")
+                "📅 Upcoming events:\n" + events.joinToString("\n")
             }
             ToolExecutionOutcome.Completed(reply)
         }
@@ -307,17 +302,15 @@ When: ${dateTimeStr.ifEmpty { "Next hour" }}",
 
         val resolvedNumber = if (isDigits) recipientRaw else lookupContactPhone(recipientRaw)
         if (resolvedNumber.isNullOrBlank()) {
-            return@withContext ToolExecutionOutcome.Completed("Could not find a phone number for "$recipientRaw" in your contacts.")
+            return@withContext ToolExecutionOutcome.Completed("Could not find a phone number for \"$recipientRaw\" in your contacts.")
         }
 
-        // Always require explicit user confirmation before sending SMS
         if (!confirmed) {
             return@withContext ToolExecutionOutcome.NeedsConfirmation(
                 PendingToolAction(
                     toolName = "send_message",
                     title = "Confirm SMS Message",
-                    details = "To: $recipientRaw ($resolvedNumber)
-Message: "$messageBody"",
+                    details = "To: $recipientRaw ($resolvedNumber)\nMessage: \"$messageBody\"",
                     request = request
                 )
             )
@@ -335,7 +328,6 @@ Message: "$messageBody"",
             )
             ToolExecutionOutcome.Completed("✉️ SMS sent to $recipientRaw ($resolvedNumber).")
         } catch (e: Exception) {
-            // Fallback to opening default SMS composer if HyperOS blocks silent background SMS
             val smsIntent = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:$resolvedNumber")).apply {
                 putExtra("sms_body", messageBody)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
