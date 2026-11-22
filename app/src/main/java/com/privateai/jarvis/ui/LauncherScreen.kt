@@ -22,6 +22,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Search
@@ -46,9 +47,10 @@ import com.privateai.jarvis.data.VaultDatabase
 import com.privateai.jarvis.launcher.AppRepository
 import com.privateai.jarvis.launcher.InstalledApp
 import com.privateai.jarvis.security.SecurityManager
+import com.privateai.jarvis.tools.ToolExecutor
 import kotlinx.coroutines.launch
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun LauncherScreen(
     securityManager: SecurityManager,
@@ -59,11 +61,15 @@ fun LauncherScreen(
     val appRepo = remember { AppRepository(context) }
     val dao = remember { database.vaultDao() }
     val chatClient = remember { CloudChatClient(context, securityManager) }
+    val toolExecutor = remember { ToolExecutor(context, appRepo, dao) }
 
-    var selectedTab by remember { mutableIntStateOf(0) }
+    var selectedTab by remember { mutableIntStateOf(0) } // 0 = Agent, 1 = Apps, 2 = Logs/Vault
     var allApps by remember { mutableStateOf<List<InstalledApp>>(emptyList()) }
     var searchQuery by remember { mutableStateOf("") }
     var showSetupSheet by remember { mutableStateOf(false) }
+
+    // Detect soft keyboard visibility so bottom navigation bar hides cleanly while typing
+    val isImeVisible = WindowInsets.isImeVisible
 
     val pinnedEntities by dao.observePinnedApps().collectAsState(initial = emptyList())
     val pinnedPackages = remember(pinnedEntities) { pinnedEntities.map { it.packageName }.toSet() }
@@ -89,6 +95,7 @@ fun LauncherScreen(
 
     Scaffold(
         containerColor = Color(0xFF0A0E17),
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
         topBar = {
             Row(
                 modifier = Modifier
@@ -107,7 +114,7 @@ fun LauncherScreen(
                         letterSpacing = 2.5.sp
                     )
                     Text(
-                        text = if (securityManager.isCloudConfigured()) "Vault Encrypted • Cloud Linked" else "Vault Encrypted • Setup Cloud Key",
+                        text = if (securityManager.isCloudConfigured()) "Vault Encrypted • 5 Tools Active" else "Vault Encrypted • Setup Cloud Key",
                         color = Color(0xFF64748B),
                         fontSize = 11.sp
                     )
@@ -132,36 +139,51 @@ fun LauncherScreen(
             }
         },
         bottomBar = {
-            NavigationBar(
-                containerColor = Color(0xFF111827),
-                contentColor = Color.White
-            ) {
-                NavigationBarItem(
-                    selected = selectedTab == 0,
-                    onClick = { selectedTab = 0 },
-                    icon = { Icon(Icons.Default.AutoAwesome, contentDescription = "Agent") },
-                    label = { Text("Agent") },
-                    colors = NavigationBarItemDefaults.colors(
-                        selectedIconColor = Color(0xFF38BDF8),
-                        selectedTextColor = Color(0xFF38BDF8),
-                        indicatorColor = Color(0xFF1E3A5F),
-                        unselectedIconColor = Color(0xFF64748B),
-                        unselectedTextColor = Color(0xFF64748B)
+            if (!isImeVisible) {
+                NavigationBar(
+                    containerColor = Color(0xFF111827),
+                    contentColor = Color.White
+                ) {
+                    NavigationBarItem(
+                        selected = selectedTab == 0,
+                        onClick = { selectedTab = 0 },
+                        icon = { Icon(Icons.Default.AutoAwesome, contentDescription = "Agent") },
+                        label = { Text("Agent") },
+                        colors = NavigationBarItemDefaults.colors(
+                            selectedIconColor = Color(0xFF38BDF8),
+                            selectedTextColor = Color(0xFF38BDF8),
+                            indicatorColor = Color(0xFF1E3A5F),
+                            unselectedIconColor = Color(0xFF64748B),
+                            unselectedTextColor = Color(0xFF64748B)
+                        )
                     )
-                )
-                NavigationBarItem(
-                    selected = selectedTab == 1,
-                    onClick = { selectedTab = 1 },
-                    icon = { Icon(Icons.Default.Apps, contentDescription = "Apps") },
-                    label = { Text("Apps (${allApps.size})") },
-                    colors = NavigationBarItemDefaults.colors(
-                        selectedIconColor = Color(0xFF38BDF8),
-                        selectedTextColor = Color(0xFF38BDF8),
-                        indicatorColor = Color(0xFF1E3A5F),
-                        unselectedIconColor = Color(0xFF64748B),
-                        unselectedTextColor = Color(0xFF64748B)
+                    NavigationBarItem(
+                        selected = selectedTab == 1,
+                        onClick = { selectedTab = 1 },
+                        icon = { Icon(Icons.Default.Apps, contentDescription = "Apps") },
+                        label = { Text("Apps (${allApps.size})") },
+                        colors = NavigationBarItemDefaults.colors(
+                            selectedIconColor = Color(0xFF38BDF8),
+                            selectedTextColor = Color(0xFF38BDF8),
+                            indicatorColor = Color(0xFF1E3A5F),
+                            unselectedIconColor = Color(0xFF64748B),
+                            unselectedTextColor = Color(0xFF64748B)
+                        )
                     )
-                )
+                    NavigationBarItem(
+                        selected = selectedTab == 2,
+                        onClick = { selectedTab = 2 },
+                        icon = { Icon(Icons.Default.History, contentDescription = "Logs") },
+                        label = { Text("Logs") },
+                        colors = NavigationBarItemDefaults.colors(
+                            selectedIconColor = Color(0xFF38BDF8),
+                            selectedTextColor = Color(0xFF38BDF8),
+                            indicatorColor = Color(0xFF1E3A5F),
+                            unselectedIconColor = Color(0xFF64748B),
+                            unselectedTextColor = Color(0xFF64748B)
+                        )
+                    )
+                }
             }
         }
     ) { innerPadding ->
@@ -169,17 +191,20 @@ fun LauncherScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
+                .consumeWindowInsets(innerPadding)
         ) {
-            if (selectedTab == 0) {
-                ChatPanel(
+            when (selectedTab) {
+                0 -> ChatPanel(
                     dao = dao,
                     chatClient = chatClient,
+                    toolExecutor = toolExecutor,
+                    installedAppNames = allApps.map { it.label },
                     onOpenSettings = { showSetupSheet = true }
                 )
-            } else {
-                Column(
+                1 -> Column(
                     modifier = Modifier
                         .fillMaxSize()
+                        .imePadding()
                         .padding(horizontal = 16.dp)
                 ) {
                     OutlinedTextField(
@@ -218,8 +243,8 @@ fun LauncherScreen(
                                         scope.launch {
                                             dao.insertLog(
                                                 ActionLogEntity(
-                                                    toolName = "launch_app",
-                                                    summary = "Launched ${app.label}",
+                                                    toolName = "open_app",
+                                                    summary = "Launched ${app.label} from grid",
                                                     status = "EXECUTED"
                                                 )
                                             )
@@ -239,6 +264,7 @@ fun LauncherScreen(
                         }
                     }
                 }
+                else -> VaultLogsPanel(dao = dao)
             }
         }
     }
@@ -352,7 +378,7 @@ private fun SetupAndHyperOsSheet(
         OutlinedTextField(
             value = modelName,
             onValueChange = { modelName = it },
-            label = { Text("Model ID (e.g. google/gemini-2.5-flash)") },
+            label = { Text("Model ID (e.g. gemini-3.5-flash-lite)") },
             singleLine = true,
             modifier = Modifier.fillMaxWidth()
         )
