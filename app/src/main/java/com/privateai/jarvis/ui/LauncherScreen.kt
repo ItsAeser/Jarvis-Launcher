@@ -68,7 +68,6 @@ fun LauncherScreen(
     var searchQuery by remember { mutableStateOf("") }
     var showSetupSheet by remember { mutableStateOf(false) }
 
-    // Detect soft keyboard visibility so bottom navigation bar hides cleanly while typing
     val isImeVisible = WindowInsets.isImeVisible
 
     val pinnedEntities by dao.observePinnedApps().collectAsState(initial = emptyList())
@@ -95,7 +94,6 @@ fun LauncherScreen(
 
     Scaffold(
         containerColor = Color(0xFF0A0E17),
-        contentWindowInsets = WindowInsets(0, 0, 0, 0),
         topBar = {
             Row(
                 modifier = Modifier
@@ -459,15 +457,26 @@ private fun SetupAndHyperOsSheet(
 
         OutlinedButton(
             onClick = {
-                context.startActivity(
-                    Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                        data = Uri.parse("package:${context.packageName}")
+                try {
+                    val intent = Intent("miui.intent.action.APP_PERM_EDITOR").apply {
+                        setClassName(
+                            "com.miui.securitycenter",
+                            "com.miui.permcenter.permissions.PermissionsEditorActivity"
+                        )
+                        putExtra("extra_pkgname", context.packageName)
                     }
-                )
+                    context.startActivity(intent)
+                } catch (_: Exception) {
+                    context.startActivity(
+                        Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                            data = Uri.parse("package:${context.packageName}")
+                        }
+                    )
+                }
             },
             modifier = Modifier.fillMaxWidth()
         ) {
-            Text("4. App Info (Allow Restricted Settings)")
+            Text("4. HyperOS Background Pop-up & App Permissions")
         }
 
         Spacer(modifier = Modifier.height(16.dp))

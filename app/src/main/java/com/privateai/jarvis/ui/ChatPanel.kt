@@ -32,6 +32,7 @@ import com.privateai.jarvis.tools.PendingToolAction
 import com.privateai.jarvis.tools.ToolExecutionOutcome
 import com.privateai.jarvis.tools.ToolExecutor
 import kotlinx.coroutines.launch
+import org.json.JSONObject
 
 @Composable
 fun ChatPanel(
@@ -87,7 +88,6 @@ fun ChatPanel(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .imePadding() // Keeps input bar glued above the keyboard when open and drops down when closed
             .padding(horizontal = 16.dp)
     ) {
         LazyColumn(
@@ -168,10 +168,11 @@ fun ChatPanel(
             }
         }
 
-        // Prompt Input Bar (rides above soft keyboard via imePadding)
+        // Prompt Input Bar: imePadding() lifts it cleanly above the keyboard and drops it back down on dismiss
         Row(
             modifier = Modifier
                 .fillMaxWidth()
+                .imePadding()
                 .padding(vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -201,6 +202,30 @@ fun ChatPanel(
                         isSending = true
                         scope.launch {
                             dao.insertChat(ChatMessageEntity(role = "user", text = prompt))
+
+                            // Fast local rule: "open <app>" or "launch <app>" executes immediately without waiting on cloud LLM
+                            val localOpenMatch = Regex("^(?:open|launch|start)\\s+(.+)$", RegexOption.IGNORE_CASE)
+                                .matchEntire(prompt)
+                            if (localOpenMatch != null) {
+                                val targetApp = localOpenMatch.groupValues[1].trim()
+                                val req = ToolRequest(
+                                    tool = "open_app",
+                                    args = JSONObject().put("app_name", targetApp)
+                                )
+                                val outcome = toolExecutor.handleToolRequest(req, confirmed = false)
+                                handleOutcome(
+                                    outcome = outcome,
+                                    dao = dao,
+                                    onNeedConfirm = { pendingConfirmation = it },
+                                    onNeedPermission = { perms, r ->
+                                        pendingPermissionTool = r
+                                        permissionLauncher.launch(perms.toTypedArray())
+                                    }
+                                )
+                                isSending = false
+                                return@launch
+                            }
+
                             val result = chatClient.sendMessage(messages, prompt, installedAppNames)
                             result.fold(
                                 onSuccess = { turn ->

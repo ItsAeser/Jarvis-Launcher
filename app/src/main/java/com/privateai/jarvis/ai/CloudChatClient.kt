@@ -78,7 +78,7 @@ class CloudChatClient(
         }
 
         try {
-            val appsSample = installedAppNames.take(120).joinToString(", ")
+            val appsSample = installedAppNames.take(150).joinToString(", ")
             val systemPrompt = """
                 You are J.A.R.V.I.S., a private Android personal assistant and home-screen agent.
                 User name: ${securityManager.getUserName()}.
@@ -96,7 +96,7 @@ class CloudChatClient(
                 - `send_message`: {"recipient": "name or phone number", "message": "string"} -> Prepares an SMS message (user must confirm before sending).
 
                 RESPONSE FORMAT:
-                If the user wants you to perform one of the 5 actions above, respond ONLY with a raw JSON object (no markdown fences, no extra text):
+                If the user wants you to perform one of the 5 actions above, output ONLY a single JSON object with no conversational text before or after it:
                 {"tool": "<tool_name>", "args": { ... }, "say": "<short natural confirmation message>"}
 
                 Otherwise, respond normally in plain conversational text.
@@ -122,7 +122,7 @@ class CloudChatClient(
             val payload = JSONObject().apply {
                 put("model", securityManager.getApiModel())
                 put("messages", messagesArray)
-                put("temperature", 0.3)
+                put("temperature", 0.2)
             }
 
             val endpoint = "${securityManager.getApiBaseUrl()}/chat/completions"
@@ -156,15 +156,13 @@ class CloudChatClient(
     }
 
     private fun parseAgentResponse(raw: String): AgentTurnResponse {
-        val cleaned = raw
-            .removePrefix("```json")
-            .removePrefix("```")
-            .removeSuffix("```")
-            .trim()
-
-        if (cleaned.startsWith("{") && cleaned.endsWith("}")) {
+        // Extract JSON object even if the LLM included text or markdown fences around it
+        val startIdx = raw.indexOf('{')
+        val endIdx = raw.lastIndexOf('}')
+        if (startIdx != -1 && endIdx > startIdx) {
+            val candidate = raw.substring(startIdx, endIdx + 1)
             try {
-                val obj = JSONObject(cleaned)
+                val obj = JSONObject(candidate)
                 if (obj.has("tool")) {
                     val toolName = obj.getString("tool").trim()
                     val args = obj.optJSONObject("args") ?: JSONObject()
@@ -175,7 +173,7 @@ class CloudChatClient(
                     )
                 }
             } catch (_: Exception) {
-                // Fall back to normal text reply
+                // Fall back to plain text
             }
         }
         return AgentTurnResponse(replyText = raw)
