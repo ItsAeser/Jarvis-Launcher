@@ -1762,7 +1762,7 @@ private fun JarvisReactiveOrb(
 
             // Iridescent lobes orbiting the core
             val lobeRadius = base * 0.42f * (1f + energy * 0.5f)
-            val angle1 = spin * (PI / 180f)
+            val angle1 = spin * (PI.toFloat() / 180f)
             val lobe1 = Offset(
                 center.x + cos(angle1) * base * 0.5f,
                 center.y + sin(angle1) * base * 0.5f
@@ -1777,7 +1777,7 @@ private fun JarvisReactiveOrb(
                 center = lobe1
             )
 
-            val angle2 = counterSpin * (PI / 180f)
+            val angle2 = counterSpin * (PI.toFloat() / 180f)
             val lobe2 = Offset(
                 center.x + cos(angle2) * base * 0.42f,
                 center.y + sin(angle2) * base * 0.42f
