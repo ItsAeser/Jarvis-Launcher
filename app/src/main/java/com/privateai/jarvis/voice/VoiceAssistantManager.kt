@@ -107,24 +107,44 @@ class VoiceAssistantManager(private val context: Context) {
      * Muting STREAM_MUSIC briefly during silent wake-word starts blocks the ding
      * without ever touching HyperOS Silent/Ringer/DND mode.
      */
+    @Volatile
+    private var pendingUnmute: Runnable? = null
+
     private fun muteWakeDingSafely() {
         try {
-            if (!audioManager.isMusicActive && !isMusicMutedForWake) {
-                audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
-                isMusicMutedForWake = true
-            }
+            pendingUnmute?.let { mainHandler.removeCallbacks(it) }
+            pendingUnmute = null
+            if (isMusicMutedForWake) return
+            // Never fight a mute the user set themselves on the media stream
+            if (audioManager.isStreamMute(AudioManager.STREAM_MUSIC)) return
+            audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_MUTE, 0)
+            isMusicMutedForWake = true
         } catch (_: Throwable) {
         }
     }
 
     private fun unmuteWakeDingSafely() {
         try {
+            pendingUnmute?.let { mainHandler.removeCallbacks(it) }
+            pendingUnmute = null
             if (isMusicMutedForWake) {
                 audioManager.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
                 isMusicMutedForWake = false
             }
         } catch (_: Throwable) {
         }
+    }
+
+    /**
+     * Keeps the media stream muted a moment longer so the recognizer's stop chime
+     * is swallowed as well; every recognition path ends here (or in
+     * [releaseQuietFocus]) so the stream is always restored.
+     */
+    private fun scheduleUnmute(delayMs: Long = 250L) {
+        pendingUnmute?.let { mainHandler.removeCallbacks(it) }
+        val runnable = Runnable { unmuteWakeDingSafely() }
+        pendingUnmute = runnable
+        mainHandler.postDelayed(runnable, delayMs)
     }
 
     private fun acquireQuietFocus() {
@@ -222,11 +242,8 @@ class VoiceAssistantManager(private val context: Context) {
         wakeRecognizer = recognizer
 
         try {
-            muteWakeDingSafely()
             recognizer.setRecognitionListener(object : RecognitionListener {
-                override fun onReadyForSpeech(params: Bundle?) {
-                    mainHandler.postDelayed({ unmuteWakeDingSafely() }, 120L)
-                }
+                override fun onReadyForSpeech(params: Bundle?) {}
                 override fun onBeginningOfSpeech() {}
                 override fun onRmsChanged(rmsdB: Float) {
                     // Map typical speech RMS (-2 dB to 10 dB) into 0f..1f for the reactive orb
@@ -234,18 +251,16 @@ class VoiceAssistantManager(private val context: Context) {
                     _voiceAmplitude.value = normalized
                 }
                 override fun onBufferReceived(buffer: ByteArray?) {}
-                override fun onEndOfSpeech() {
-                    muteWakeDingSafely()
-                }
+                override fun onEndOfSpeech() {}
 
                 override fun onError(error: Int) {
-                    releaseQuietFocus()
+                    scheduleUnmute(250L)
                     destroyWakeRecognizer()
                     scheduleWakeCycle(1400L)
                 }
 
                 override fun onResults(results: Bundle?) {
-                    releaseQuietFocus()
+                    scheduleUnmute(250L)
                     val heard = results
                         ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         ?.firstOrNull()
@@ -264,7 +279,8 @@ class VoiceAssistantManager(private val context: Context) {
                     if (partial.equals("jarvis", ignoreCase = true) ||
                         partial.equals("hey jarvis", ignoreCase = true)
                     ) {
-                        releaseQuietFocus()
+                        // Stay muted across the stop call so the recognizer's stop
+                        // chime is swallowed too; handleWakeTranscript restores it.
                         destroyWakeRecognizer()
                         handleWakeTranscript(partial)
                     }
@@ -273,6 +289,10 @@ class VoiceAssistantManager(private val context: Context) {
                 override fun onEvent(eventType: Int, params: Bundle?) {}
             })
 
+            // Silent wake: mute the media stream just before the recognizer starts so
+            // its start/stop chime never reaches the speaker (wake passes are skipped
+            // while music is playing, so this never interrupts audio).
+            muteWakeDingSafely()
             recognizer.startListening(buildRecognizerIntent(silentPrompt = true))
         } catch (_: Throwable) {
             releaseQuietFocus()
@@ -286,8 +306,9 @@ class VoiceAssistantManager(private val context: Context) {
         val wakeRegex = Regex("^(?:hey\\s+|ok\\s+)?jarvis[,\\s]*(.*)$", RegexOption.IGNORE_CASE)
         val match = wakeRegex.matchEntire(lower)
         if (match != null) {
-            unmuteWakeDingSafely()
-            playJarvisAckChime()
+            // Fully silent wake: no chime, no spoken acknowledgement. The orb's
+            // listening state is the only feedback until the user speaks.
+            scheduleUnmute(200L)
             val trailingCommand = transcript
                 .replace(Regex("^(?:hey\\s+|ok\\s+)?jarvis[,\\s]*", RegexOption.IGNORE_CASE), "")
                 .trim()
@@ -295,12 +316,11 @@ class VoiceAssistantManager(private val context: Context) {
                 wakeCallback?.invoke(trailingCommand)
                 scheduleWakeCycle(2000L)
             } else {
-                speak("At your service.")
-                mainHandler.postDelayed({
-                    wakeCallback?.invoke(null)
-                }, 800L)
+                // Open the mic immediately — no waiting on a spoken reply.
+                wakeCallback?.invoke(null)
             }
         } else {
+            scheduleUnmute(250L)
             scheduleWakeCycle(1100L)
         }
     }
@@ -328,6 +348,7 @@ class VoiceAssistantManager(private val context: Context) {
                 override fun onReadyForSpeech(params: Bundle?) {
                     _isListening.value = true
                     _partialText.value = ""
+                    scheduleUnmute(220L)
                 }
 
                 override fun onBeginningOfSpeech() {}
@@ -340,10 +361,12 @@ class VoiceAssistantManager(private val context: Context) {
 
                 override fun onEndOfSpeech() {
                     _isListening.value = false
+                    // Re-mute so the recognizer's end-of-speech chime is silent too
+                    if (!audioManager.isMusicActive) muteWakeDingSafely()
                 }
 
                 override fun onError(error: Int) {
-                    releaseQuietFocus()
+                    scheduleUnmute(250L)
                     _isListening.value = false
                     _voiceAmplitude.value = 0f
                     _partialText.value = ""
@@ -362,7 +385,7 @@ class VoiceAssistantManager(private val context: Context) {
                 }
 
                 override fun onResults(results: Bundle?) {
-                    releaseQuietFocus()
+                    scheduleUnmute(250L)
                     _isListening.value = false
                     val text = results
                         ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
@@ -389,6 +412,7 @@ class VoiceAssistantManager(private val context: Context) {
                 override fun onEvent(eventType: Int, params: Bundle?) {}
             })
 
+            if (!audioManager.isMusicActive) muteWakeDingSafely()
             recognizer.startListening(buildRecognizerIntent(silentPrompt = false))
         } catch (_: Throwable) {
             releaseQuietFocus()
